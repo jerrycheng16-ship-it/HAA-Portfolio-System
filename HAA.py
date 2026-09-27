@@ -49,7 +49,6 @@ def clean_dataframe(uploaded_file):
         from io import BytesIO
         content_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
         
-        # 判斷是否為 CSV 檔案
         is_csv = hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith('.csv')
         
         df_raw = None
@@ -157,7 +156,7 @@ if "df_daily" not in st.session_state:
             ['2026-05-31', 978.03601, 824.54199, 16935.34961, 1858.56763, 44.2995, 268.1, 3254.03345, 8535.91992, 305.7231, 1898.43054, 1040.17297, 6.789, 503.778, 622.8731, 417.3398, 8204.49023, 129.647, 114.274, 242.04, 2695.81, 503.778],
             ['2026-06-30', 965.427, 804.79901, 16774.07031, 1865.46997, 43.816, 259.29, 3317.13452, 8706.2002, 304.3977, 1902.23071, 1046.87, 6.82, 500.2215, 562.81012, 369.4695, 8328.58984, 129.005, 114.561, 242.76, 2675.08, 500.2215],
             ['2026-07-31', 934.23, 844.347, 16763.42, 1907.464906, 45.37611182, 262.5, 3077.004272, 8106.35, 301.134, 1896.8195, 1030.75, 6.758, 497.5484, 620.8962, 371.54, 8524.5, 128.107, 112.96, 243.58, 2677.7, 497.5484],
-            ['2026-08-31', 964.93103, 838.54602, 17219.93945, 1931.80261, 46.45047, 277.57999, 3362.00391, 8218.0, 302.8004, 1916.45764, 1040.09, 6.818, 499.81091, 657.9306, 408.42, 8295.49023, 128.184, 113.123, 244.3, 2749.87, 499.8109]
+            ['2026-08-31', 964.93103, 838.54602, 17219.93945, 1931.80261, 46.45047, 277.57999, 3362.00391, 8218.0, 302.8004, 1916.45764, 1040.09, 6.818, 499.81091, 657.9306, 408.42, 8295.49023, 128.14, 113.123, 244.3, 2749.87, 499.8109]
         ]
         headers_list = ['Date', 'ACWI', 'Asia ex JP', 'Latam', 'S&P500', 'SXXR', 'Topix', 'Emerging Euro, Middle East, Afica', 'Taiex', 'CSI 300', 'Corp Bond', 'HY', 'EMBI', 'EMBI Corp', 'Globa Agg Local Currency', 'Commodity', 'GLD', 'REITS', 'TIP', 'Treasury', 'T Bill', 'BM_AWCI', 'BM_AGG']
         st.session_state.df_daily = pd.DataFrame(default_excel_data, columns=headers_list)
@@ -300,7 +299,6 @@ bm_mdd = 0.0
 
 fee_monthly_rate = (management_fee_pct / 100.0 / 12.0) if enable_fee else 0.0
 
-# 計數器：統計撥回機率
 cnt_low = 0    # < t_low
 cnt_mid = 0    # t_low <= NAV <= t_high
 cnt_high = 0   # > t_high
@@ -319,14 +317,12 @@ if len(df_global) > 0:
 for i in range(1, len(df_global)):
     curr_date = str(df_global.iloc[i][date_col_g])[:10]
     
-    # Benchmark: 60% * BM_ACWI + 40% * BM_AGG
     bm_ret = 0.0
     if bm_acwi_col and bm_agg_col:
         acwi_ret = (df_global.iloc[i][bm_acwi_col] / df_global.iloc[i-1][bm_acwi_col]) - 1.0
         agg_ret = (df_global.iloc[i][bm_agg_col] / df_global.iloc[i-1][bm_agg_col]) - 1.0
         bm_ret = 0.6 * acwi_ret + 0.4 * agg_ret
     
-    # Portfolio 未扣費月報酬率
     port_ret_raw = 0.0
     if i - 1 >= 12:
         weights, _ = calc_weights_for_row(i - 1, df_global)
@@ -337,7 +333,6 @@ for i in range(1, len(df_global)):
     else:
         port_ret_raw = bm_ret
 
-    # 判定階梯撥回率 (根據前一期淨值)
     payout_annual_rate = 0.0
     if enable_payout:
         prev_nav = portfolio_nav
@@ -354,14 +349,11 @@ for i in range(1, len(df_global)):
 
     payout_monthly_rate = (payout_annual_rate / 100.0 / 12.0) if enable_payout else 0.0
 
-    # 淨值公式：當期淨值 = 前期淨值 * (1 + 未扣費月報酬率 - 經管費率/12 - 撥回率/12)
     portfolio_nav = portfolio_nav * (1.0 + port_ret_raw - fee_monthly_rate - payout_monthly_rate)
     benchmark_nav *= (1.0 + bm_ret)
     
-    # 當月實際淨值總變動率
     port_ret_final = port_ret_raw - fee_monthly_rate - payout_monthly_rate
     
-    # Peak & MDD
     if portfolio_nav > port_peak:
         port_peak = portfolio_nav
     port_dd = (portfolio_nav - port_peak) / port_peak
@@ -384,7 +376,6 @@ for i in range(1, len(df_global)):
 
 df_monthly_perf = pd.DataFrame(monthly_perf_records)
 
-# 計算年化報酬率 (CAGR)
 start_d = pd.to_datetime(df_global.iloc[0][date_col_g])
 end_d = pd.to_datetime(df_global.iloc[-1][date_col_g])
 years = max((end_d - start_d).days / 365.25, 0.08)
@@ -398,10 +389,26 @@ total_bm_ret = ((latest_bm_nav / 10.0) - 1.0) * 100
 port_cagr = (((latest_port_nav / 10.0) ** (1.0 / years)) - 1.0) * 100
 bm_cagr = (((latest_bm_nav / 10.0) ** (1.0 / years)) - 1.0) * 100
 
-# 撥回機率計算
 prob_low = (cnt_low / total_payout_months * 100) if total_payout_months > 0 else 0.0
 prob_mid = (cnt_mid / total_payout_months * 100) if total_payout_months > 0 else 0.0
 prob_high = (cnt_high / total_payout_months * 100) if total_payout_months > 0 else 0.0
+
+# -------------------------------------------------------------
+# 計算今年 YTD 報酬率
+# -------------------------------------------------------------
+current_year = pd.to_datetime(df_global.iloc[-1][date_col_g]).year
+df_ytd = df_monthly_perf[df_monthly_perf['Date'].str.startswith(str(current_year))]
+if len(df_ytd) > 1:
+    start_ytd_port = df_ytd.iloc[0]["Portfolio 淨值"]
+    end_ytd_port = df_ytd.iloc[-1]["Portfolio 淨值"]
+    port_ytd_ret = ((end_ytd_port / start_ytd_port) - 1.0) * 100
+
+    start_ytd_bm = df_ytd.iloc[0]["Benchmark 淨值"]
+    end_ytd_bm = df_ytd.iloc[-1]["Benchmark 淨值"]
+    bm_ytd_ret = ((end_ytd_bm / start_ytd_bm) - 1.0) * 100
+else:
+    port_ytd_ret = total_port_ret
+    bm_ytd_ret = total_bm_ret
 
 # -------------------------------------------------------------
 # 頂部：績效總覽（同時展示 Portfolio、Benchmark 及撥回機率）
@@ -454,6 +461,56 @@ line_chart = alt.Chart(df_chart).mark_line(size=2.5).encode(
 rule_10 = alt.Chart(pd.DataFrame({'y': [10.0]})).mark_rule(color='#94A3B8', strokeDash=[4, 4]).encode(y='y:Q')
 
 st.altair_chart(line_chart + rule_10, use_container_width=True)
+
+# -------------------------------------------------------------
+# 📊 報酬率比較分析：過去三個月月報酬率 & 今年 YTD 累積報酬率（統一排序與不截斷 X 軸）
+# -------------------------------------------------------------
+st.markdown("### 📈 策略與 Benchmark 報酬率比較分析")
+col_bar1, col_bar2 = st.columns(2)
+
+with col_bar1:
+    st.subheader("📌 過去三個月月報酬率比較 (%)")
+    if len(df_monthly_perf) >= 3:
+        df_last3 = df_monthly_perf.tail(3).copy()
+    else:
+        df_last3 = df_monthly_perf.copy()
+        
+    df_last3_melted = df_last3.melt(
+        id_vars=['Date'],
+        value_vars=['Portfolio 月報酬率 (%)', 'Benchmark 月報酬率 (%)'],
+        var_name='類型',
+        value_name='月報酬率 (%)'
+    )
+    df_last3_melted['類型'] = df_last3_melted['類型'].replace({
+        'Portfolio 月報酬率 (%)': 'HAA 策略',
+        'Benchmark 月報酬率 (%)': 'Benchmark'
+    })
+    
+    bar_monthly = alt.Chart(df_last3_melted).mark_bar().encode(
+        x=alt.X('Date:N', title='月份', axis=alt.Axis(labelAngle=0)),
+        y=alt.Y('月報酬率 (%):Q', title='月報酬率 (%)'),
+        color=alt.Color('類型:N', title='標的', scale=alt.Scale(domain=['HAA 策略', 'Benchmark'], range=['#2563EB', '#F59E0B'])),
+        xOffset='類型:N',
+        tooltip=['Date', '類型', alt.Tooltip('月報酬率 (%):Q', format='.2f')]
+    ).properties(height=300)
+    st.altair_chart(bar_monthly, use_container_width=True)
+
+with col_bar2:
+    st.subheader(f"📌 今年 ({current_year}) YTD 累積報酬率比較 (%)")
+    # 統一排序：左邊為 HAA 策略，右邊為 Benchmark，名稱與左圖顏色對應
+    df_ytd_bar = pd.DataFrame({
+        "指標": ["HAA 策略", "Benchmark (股6債4)"],
+        "YTD 報酬率 (%)": [round(port_ytd_ret, 2), round(bm_ytd_ret, 2)]
+    })
+    
+    bar_ytd = alt.Chart(df_ytd_bar).mark_bar(width=60).encode(
+        # 確保 x 軸標籤完整顯示，不被截斷
+        x=alt.X('指標:N', title=None, sort=['HAA 策略', 'Benchmark (股6債4)'], axis=alt.Axis(labelAngle=0, labelLimit=250)),
+        y=alt.Y('YTD 報酬率 (%):Q', title='YTD 報酬率 (%)'),
+        color=alt.Color('指標:N', legend=None, scale=alt.Scale(domain=['HAA 策略', 'Benchmark (股6債4)'], range=['#2563EB', '#F59E0B'])),
+        tooltip=['指標', alt.Tooltip('YTD 報酬率 (%):Q', format='.2f')]
+    ).properties(height=300)
+    st.altair_chart(bar_ytd, use_container_width=True)
 
 st.markdown("---")
 
