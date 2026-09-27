@@ -586,7 +586,7 @@ if selected_tab == "1. 資產配置與權重圖":
             df_base = df_plot[["Asset", "Month"]].drop_duplicates().copy()
             df_base["BaseColor"] = "#ffffff"
             
-            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資產配置熱力圖 (0~3% 白、3%~50% 淺綠$\rightarrow$深綠、50%以上紅)")
+            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資產配置熱力圖 
             
             base_layer = alt.Chart(df_base).mark_rect(stroke='#e0e0e0', strokeWidth=1, fill='#ffffff').encode(
                 x=alt.X('Month:N', title='月份', axis=alt.Axis(labelAngle=0, labelFontSize=12, titleFontSize=14)),
