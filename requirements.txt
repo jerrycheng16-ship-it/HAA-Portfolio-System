@@ -2,4 +2,6 @@ streamlit
 pandas
 numpy
 altair
-openpyxl
+feedparser
+openai
+yfinance
