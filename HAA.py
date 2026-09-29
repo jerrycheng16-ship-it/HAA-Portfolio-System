@@ -13,7 +13,7 @@ SAVED_DAILY_PATH = "last_uploaded_daily_data.csv"
 
 # 頁面基本設定
 st.set_page_config(
-    page_title="HAA 多重資產動態配置系統",
+    page_title="HAA 多重資態動態配置系統",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -75,7 +75,7 @@ TICKER_MAP = {
 
 @st.cache_data(ttl=3600)
 def load_yahoo_data(start_str, end_str):
-    """連線 Yahoo Finance 自動下載美金計價含息價格之歷史每日與月底數據"""
+    """連線 Yahoo Finance 自動下載美金計價含息價格之歷史每日與月底數據，並自動由舊到新排序"""
     tickers = list(TICKER_MAP.values())
     df_raw = yf.download(tickers, start=start_str, end=end_str, interval="1d", auto_adjust=True, progress=False)
     
@@ -98,16 +98,20 @@ def load_yahoo_data(start_str, end_str):
     inv_map = {v: k for k, v in TICKER_MAP.items()}
     df_daily = df_daily.rename(columns=inv_map)
     
-    df_temp = df_daily.copy()
-    df_temp['Date_dt'] = pd.to_datetime(df_temp['Date'])
-    df_monthly = df_temp.groupby(df_temp['Date_dt'].dt.to_period('M')).last().reset_index(drop=True)
+    # 確保每日價格依 Date 由舊到新排序
+    df_daily['Date_dt'] = pd.to_datetime(df_daily['Date'])
+    df_daily = df_daily.sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
+    
+    # 取月底價格
+    df_monthly = df_daily.groupby(df_daily['Date_dt'].dt.to_period('M')).last().reset_index(drop=True)
     df_monthly['Date'] = df_monthly['Date_dt'].dt.strftime('%Y-%m-%d')
     df_monthly = df_monthly.drop(columns=['Date_dt'])
+    df_daily = df_daily.drop(columns=['Date_dt'])
     
     return df_daily, df_monthly
 
 def clean_dataframe(uploaded_file):
-    """安全解析手動上傳（如 Bloomberg 匯出）之 Excel/CSV 檔案"""
+    """安全解析手動上傳（如 Bloomberg 匯出）之 Excel/CSV 檔案，並自動依日期由舊到新排序"""
     try:
         content_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
         is_csv = hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith('.csv')
@@ -155,6 +159,12 @@ def clean_dataframe(uploaded_file):
             if col != "Date":
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 
+        # -------------------------------------------------------------
+        # 強制依日期由舊到新 (升冪 ascending=True) 排序
+        # -------------------------------------------------------------
+        df['Date_tmp'] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp'])
+        
         return df.reset_index(drop=True)
     except Exception as e:
         st.error(f"檔案解析失敗：{e}")
@@ -205,7 +215,10 @@ if "df_daily" not in st.session_state:
             ['2026-08-31', 964.93103, 838.54602, 17219.93945, 1931.80261, 46.45047, 277.57999, 3362.00391, 8218.0, 302.8004, 1916.45764, 1040.09, 6.818, 499.81091, 657.9306, 408.42, 8295.49023, 128.14, 113.123, 244.3, 2749.87, 499.8109]
         ]
         headers_list = ['Date', 'ACWI', 'Asia ex JP', 'Latam', 'S&P500', 'SXXR', 'Topix', 'Emerging Euro, Middle East, Afica', 'Taiex', 'CSI 300', 'Corp Bond', 'HY', 'EMBI', 'EMBI Corp', 'Globa Agg Local Currency', 'Commodity', 'GLD', 'REITS', 'TIP', 'Treasury', 'T Bill', 'BM_AWCI', 'BM_AGG']
-        st.session_state.df_daily = pd.DataFrame(default_excel_data, columns=headers_list)
+        df_init = pd.DataFrame(default_excel_data, columns=headers_list)
+        df_init['Date_tmp'] = pd.to_datetime(df_init['Date'], errors='coerce')
+        df_init = df_init.sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
+        st.session_state.df_daily = df_init
 
 # -------------------------------------------------------------
 # 頂部控制項：回測日期與參數設定區
@@ -629,7 +642,7 @@ if selected_tab == "1. 資產配置與權重圖":
             df_base = df_plot[["Asset", "Month"]].drop_duplicates().copy()
             df_base["BaseColor"] = "#ffffff"
             
-            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資產配置熱力圖")
+            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資態配置熱力圖")
             base_layer = alt.Chart(df_base).mark_rect(stroke='#e0e0e0', strokeWidth=1, fill='#ffffff').encode(
                 x=alt.X('Month:N', title='月份', axis=alt.Axis(labelAngle=0, labelFontSize=12, titleFontSize=14)),
                 y=alt.Y('Asset:N', title='資產標的', sort=chart_cols, axis=alt.Axis(labelFontSize=12, titleFontSize=14)),
@@ -730,7 +743,7 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
         if cleaned_df is not None:
             st.session_state.df_daily = cleaned_df
             cleaned_df.to_csv(SAVED_MONTHLY_PATH, index=False)
-            st.success(f"成功載入自訂月底價格檔案，共計 {len(st.session_state.df_daily)} 筆資料！")
+            st.success(f"成功載入自訂月底價格檔案，共計 {len(st.session_state.df_daily)} 筆資料，且已自動由舊到新排序！")
 
     st.subheader("步驟二：月底歷史價格矩陣核對與互動編輯")
     edited_df = st.data_editor(st.session_state.get("df_daily", pd.DataFrame()), num_rows="dynamic", key="daily_editor")
@@ -738,6 +751,11 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
     col_save, col_reset = st.columns([1, 1])
     with col_save:
         if st.button("🔄 儲存變更並重新計算策略配置", type="primary"):
+            # 確保儲存前再次驗證排序
+            date_col_e = edited_df.columns[0]
+            edited_df['Date_tmp'] = pd.to_datetime(edited_df[date_col_e], errors='coerce')
+            edited_df = edited_df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
+            
             st.session_state.df_daily = edited_df
             edited_df.to_csv(SAVED_MONTHLY_PATH, index=False)
             st.success("已成功儲存變更至本地，並更新策略配置！")
@@ -764,7 +782,7 @@ elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
         if cleaned_daily is not None:
             st.session_state.df_daily_corr = cleaned_daily
             cleaned_daily.to_csv(SAVED_DAILY_PATH, index=False)
-            st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料！")
+            st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料，且已自動由舊到新排序！")
 
     st.subheader("步驟二：每日資產價格矩陣核對區")
     corr_source_df = st.session_state.get("df_daily_corr") if st.session_state.get("df_daily_corr") is not None else st.session_state.get("df_daily", pd.DataFrame())
