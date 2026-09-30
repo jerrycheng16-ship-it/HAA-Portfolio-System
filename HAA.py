@@ -75,7 +75,7 @@ TICKER_MAP = {
 
 @st.cache_data(ttl=3600)
 def load_yahoo_data(start_str, end_str):
-    """連線 Yahoo Finance 自動下載美金計價含息價格之歷史每日與月底數據，並自動由舊到新排序"""
+    """連線 Yahoo Finance 自動下載美金含息價格之歷史每日與月底數據，並自動由舊到新排序"""
     tickers = list(TICKER_MAP.values())
     df_raw = yf.download(tickers, start=start_str, end=end_str, interval="1d", auto_adjust=True, progress=False)
     
@@ -159,9 +159,7 @@ def clean_dataframe(uploaded_file):
             if col != "Date":
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 
-        # -------------------------------------------------------------
         # 強制依日期由舊到新 (升冪 ascending=True) 排序
-        # -------------------------------------------------------------
         df['Date_tmp'] = pd.to_datetime(df[date_col], errors='coerce')
         df = df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp'])
         
@@ -214,7 +212,7 @@ if "df_daily" not in st.session_state:
             ['2026-07-31', 934.23, 844.347, 16763.42, 1907.464906, 45.37611182, 262.5, 3077.004272, 8106.35, 301.134, 1896.8195, 1030.75, 6.758, 497.5484, 620.8962, 371.54, 8524.5, 128.107, 112.96, 243.58, 2677.7, 497.5484],
             ['2026-08-31', 964.93103, 838.54602, 17219.93945, 1931.80261, 46.45047, 277.57999, 3362.00391, 8218.0, 302.8004, 1916.45764, 1040.09, 6.818, 499.81091, 657.9306, 408.42, 8295.49023, 128.14, 113.123, 244.3, 2749.87, 499.8109]
         ]
-        headers_list = ['Date', 'ACWI', 'Asia ex JP', 'Latam', 'S&P500', 'SXXR', 'Topix', 'Emerging Euro, Middle East, Afica', 'Taiex', 'CSI 300', 'Corp Bond', 'HY', 'EMBI', 'EMBI Corp', 'Globa Agg Local Currency', 'Commodity', 'GLD', 'REITS', 'TIP', 'Treasury', 'T Bill', 'BM_AWCI', 'BM_AGG']
+        headers_list = ['Date', 'ACWI', 'Asia ex JP', 'Latam', 'S&P500', 'SXXR', 'Topix', 'Emerging Euro, Middle East, Afica', 'Taiex', 'CSI 300', 'Corp Bond', 'HY', 'EMBI', 'EMB', 'Globa Agg Local Currency', 'Commodity', 'GLD', 'REITS', 'TIP', 'Treasury', 'T Bill', 'BM_AWCI', 'BM_AGG']
         df_init = pd.DataFrame(default_excel_data, columns=headers_list)
         df_init['Date_tmp'] = pd.to_datetime(df_init['Date'], errors='coerce')
         df_init = df_init.sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
@@ -290,7 +288,7 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式
+# 核心 HAA 配置計算函式（已更新為指定動能公式）
 # -------------------------------------------------------------
 def calc_weights_for_row(target_idx, df):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
@@ -304,8 +302,9 @@ def calc_weights_for_row(target_idx, df):
         p3 = float(df.iloc[target_idx - 3][canary_col])
         p6 = float(df.iloc[target_idx - 6][canary_col])
         p12 = float(df.iloc[target_idx - 12][canary_col])
-        avg_val = (p1 + p3 + p6 + p12) / 4.0
-        canary_mom = (curr_val / avg_val) - 1.0
+        
+        # 套用使用者指定公式：((P_t/P_{t-1}-1) + (P_t/P_{t-3}-1) + (P_t/P_{t-6}-1) + (P_t/P_{t-12}-1)) / 4
+        canary_mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
     except Exception:
         canary_mom = 0.1
         
@@ -318,8 +317,8 @@ def calc_weights_for_row(target_idx, df):
         bp3 = float(df.iloc[target_idx - 3][bond_col])
         bp6 = float(df.iloc[target_idx - 6][bond_col])
         bp12 = float(df.iloc[target_idx - 12][bond_col])
-        b_avg = (bp1 + bp3 + bp6 + bp12) / 4.0
-        bond_mom = (b_curr / b_avg) - 1.0
+        
+        bond_mom = ((b_curr / bp1 - 1.0) + (b_curr / bp3 - 1.0) + (b_curr / bp6 - 1.0) + (b_curr / bp12 - 1.0)) / 4.0
     except Exception:
         pass
     
@@ -339,8 +338,8 @@ def calc_weights_for_row(target_idx, df):
                     ap3 = float(df.iloc[target_idx - 3][col])
                     ap6 = float(df.iloc[target_idx - 6][col])
                     ap12 = float(df.iloc[target_idx - 12][col])
-                    ac_avg = (ap1 + ap3 + ap6 + ap12) / 4.0
-                    ac_mom = (ac_curr / ac_avg) - 1.0
+                    
+                    ac_mom = ((ac_curr / ap1 - 1.0) + (ac_curr / ap3 - 1.0) + (ac_curr / ap6 - 1.0) + (ac_curr / ap12 - 1.0)) / 4.0
                     avg_corr = float(np.random.uniform(0.2, 0.8))
                     active_results.append({"col": col, "mom": ac_mom, "avgCorr": avg_corr})
                 except Exception:
@@ -685,8 +684,8 @@ if selected_tab == "1. 資產配置與權重圖":
                         ap3 = float(df.iloc[target_idx - 3][col])
                         ap6 = float(df.iloc[target_idx - 6][col])
                         ap12 = float(df.iloc[target_idx - 12][col])
-                        ac_avg = (ap1 + ap3 + ap6 + ap12) / 4.0
-                        mom_val = (ac_curr / ac_avg) - 1.0
+                        
+                        mom_val = ((ac_curr / ap1 - 1.0) + (ac_curr / ap3 - 1.0) + (ac_curr / ap6 - 1.0) + (ac_curr / ap12 - 1.0)) / 4.0
                         avg_corr = float(np.random.uniform(0.2, 0.8))
                     except Exception:
                         pass
@@ -719,14 +718,13 @@ elif selected_tab == "2. 金絲雀動能明細":
                 p3 = float(df.iloc[i - 3][canary_col])
                 p6 = float(df.iloc[i - 6][canary_col])
                 p12 = float(df.iloc[i - 12][canary_col])
-                avg_val = (p1 + p3 + p6 + p12) / 4.0
-                mom = (curr_val / avg_val) - 1.0
+                
+                mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
             except Exception:
-                mom, avg_val = 0.0, 0.0
+                mom = 0.0
             canary_rows.append({
                 "月份 (Date)": str(df.iloc[i][date_col])[:10],
                 "當月底價格 (T)": round(curr_val, 4) if 'curr_val' in locals() else 0,
-                "4個月平均價格": round(avg_val, 4),
                 "相對動能 (%)": f"{mom * 100:+.2f}%",
                 "狀態": "進攻 (>0)" if mom > 0 else "避險 (<=0)"
             })
@@ -751,7 +749,6 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
     col_save, col_reset = st.columns([1, 1])
     with col_save:
         if st.button("🔄 儲存變更並重新計算策略配置", type="primary"):
-            # 確保儲存前再次驗證排序
             date_col_e = edited_df.columns[0]
             edited_df['Date_tmp'] = pd.to_datetime(edited_df[date_col_e], errors='coerce')
             edited_df = edited_df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
