@@ -234,7 +234,6 @@ with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關�
 
     st.markdown("---")
     
-    # 新增：相關係數權重分配邏輯選擇
     st.markdown("#### 🔗 相關係數權重分配邏輯設定")
     corr_logic_choice = st.radio(
         "請選擇相關係數與資產權重高低的對應關係：",
@@ -301,7 +300,7 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式 (支援 reverse_flag 參數決定相關性大小與權重的方向)
+# 核心 HAA 配置計算函式 (含權重限制與相關係數排序方向)
 # -------------------------------------------------------------
 def calc_weights_for_row(target_idx, df, reverse_flag=True):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
@@ -360,13 +359,35 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
         active_results.sort(key=lambda x: x["mom"], reverse=True)
         valid_selected = [item for item in active_results if item["mom"] > 0][:7]
         
-        # 依據選項決定排序方向：reverse=True (相關性大優先), reverse=False (相關性小優先)
         valid_selected.sort(key=lambda x: x["avgCorr"], reverse=reverse_flag)
         
         K = len(valid_selected)
         S = K * (K + 1) / 2 if K > 0 else 1
         for rank_idx, item in enumerate(valid_selected):
             weights[item["col"]] = (K - rank_idx) / S
+            
+        # --- 權重限制邏輯 ---
+        hy_col = next((c for c in weights if str(c).strip().upper() == "HY"), None)
+        embi_col = next((c for c in weights if str(c).strip().upper() == "EMBI"), None)
+        embi_corp_col = next((c for c in weights if "EMBI CORP" in str(c).strip().upper() or "CEMB" in str(c).strip().upper()), None)
+        
+        excess = 0.0
+        
+        if hy_col and weights[hy_col] > 0.10:
+            excess += weights[hy_col] - 0.10
+            weights[hy_col] = 0.10
+            
+        group_cols = [c for c in [hy_col, embi_col, embi_corp_col] if c and c in weights]
+        group_sum = sum(weights.get(c, 0.0) for c in group_cols)
+        if group_sum > 0.20:
+            over_amt = group_sum - 0.20
+            excess += over_amt
+            scale = 0.20 / group_sum
+            for c in group_cols:
+                weights[c] *= scale
+                
+        if excess > 0:
+            weights[cash_col] = weights.get(cash_col, 0.0) + excess
             
     return weights, canary_mom
 
@@ -925,3 +946,36 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
             m3.metric("前一期淨值觸發撥回", f"{payout_r_ann:.1f}% /年", f"前期NAV: {prev_nav_val:.4f} ({tier_desc})")
             m4.success(f"金絲雀動能狀態：{'🚀 進攻模式' if canary_mom > 0 else '🛡️ 避險模式'}")
             st.dataframe(pd.DataFrame(check_rows), use_container_width=True)
+
+# -------------------------------------------------------------
+# 📄 模型配置邏輯說明文件
+# -------------------------------------------------------------
+with st.expander("📖 點擊展開：HAA 多重資產動態配置模型邏輯說明文件"):
+    st.markdown("""
+    <model_description>
+    ### HAA 多重資產動態配置系統：配置邏輯說明書
+
+    #### 1. 系統運作核心架構
+    本系統為基於月頻率（Month-End）動態調整的量化資產配置模型。每月底系統會自動執行以下四個步驟來決定次月的資產配置：
+    * **金絲雀防禦檢視**：判斷市場是處於「進攻模式」還是「避險模式」。
+    * **多重資產動能評估**：計算各風險資產的綜合動能分數，篩選出表現最佳的標的。
+    * **相關係數權重配置**：依據資產間的相關性高低，計算出最終的配置權重（支援使用者自訂「相關性越小權重越高」或「相關性越大權重越高」）。
+    * **部位上限與現金轉化控制**：確保高風險債券（HY、EMBI 等）不超過特定曝險上限，超額部分自動轉入短天期國庫券（T Bill）。
+
+    #### 2. 詳細配置邏輯拆解
+    * **步驟一：市場環境判定（金絲雀動能機制）**
+      * 透過防禦性資產（預設為 **TIP**）計算 1、3、6、12 個月報酬率的平均綜合相對動能。
+      * **進攻模式 ($>0$)**：啟動多重資產動能輪動。
+      * **避險模式 ($\le0$)**：若防禦債券（Treasury）動能 $>0$ 則配置 100% 債券；若 $\le0$ 則全數轉入現金（T Bill）。
+    * **步驟二：風險資產動能評估與前 7 大篩選**
+      * 計算所有全球風險資產的綜合動能分數（1、3、6、12 個月平均）。
+      * 過濾掉動能 $\le0$ 的落後資產，取動能大於 0 的**前 7 大標的**。
+    * **步驟三：相關係數權重分配邏輯**
+      * 依據資產間的**平均相關係數（$\text{avgCorr}$）**進行排序與金字塔權重分配。
+      * 可由側邊欄自由切換方向：**低相關優先配置**（相關性越小權重越高）或 **高相關優先配置**（相關性越大權重越高）。
+    * **步驟四：部位上限控管與超額轉入 T Bill**
+      * **HY 上限控管**：若 `HY` 權重超過 10%，超額部分強制扣除。
+      * **信用債組合上限控管**：`HY` + `EMBI` + `EMBI Corp` 三者加總不得超過 20%，超額部分按比例縮減。
+      * **轉入 T Bill**：因受限而被扣除的超額權重，會**全數自動轉入短天期國庫券（T Bill）**。
+    </model_description>
+    """, unsafe_allow_html=True)
