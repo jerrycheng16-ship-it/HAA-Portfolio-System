@@ -50,7 +50,7 @@ st.title("📊 HAA 多重資產動態配置系統")
 # -------------------------------------------------------------
 # 📄 模型配置邏輯說明文件 (放置於大標題下方)
 # -------------------------------------------------------------
-with st.expander("📖 點擊展開：HAA 多重資產動態配置模型邏輯與動能公式說明"):
+with st.expander("📖 點擊展開：HAA 多重資產動態配置模型邏輯與動能公式說明", expanded=False):
     st.markdown("""
     <model_description>
     ### HAA 多重資產動態配置系統：配置邏輯與動能公式說明書
@@ -207,7 +207,6 @@ if "df_daily_corr" not in st.session_state:
             st.session_state.df_daily_corr = None
 
 if "df_daily" not in st.session_state:
-    # 優先從本地持久化儲存讀取月底歷史資料
     if os.path.exists(SAVED_MONTHLY_PATH):
         try:
             st.session_state.df_daily = pd.read_csv(SAVED_MONTHLY_PATH)
@@ -216,7 +215,6 @@ if "df_daily" not in st.session_state:
             if os.path.exists(SAVED_MONTHLY_PATH):
                 os.remove(SAVED_MONTHLY_PATH)
 
-    # 若無本地儲存檔，則載入預設模擬資料
     if "df_daily" not in st.session_state:
         default_excel_data = [
             ['2024-12-31', 455.98969, 578.39697, 470.595, 12911.82031, 1279.98499, 30.4882, 204.17, 1552.3064, 6184.0498, 275.4921, 1661.86304, 897.19098, 6.164, 463.4374, 457.0121, 240.9976, 7090.06982, 119.166, 105.854, 228.65, 1952.8, 463.4374],
@@ -248,7 +246,7 @@ if "df_daily" not in st.session_state:
         st.session_state.df_daily = df_init
 
 # -------------------------------------------------------------
-# 頂部控制項：回測日期與參數設定區
+# 頂部控制項：回測日期與參數設定區（預設收合）
 # -------------------------------------------------------------
 with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關係數權重邏輯設定區", expanded=False):
     col_d1, col_d2, col_btn = st.columns([2, 2, 1])
@@ -315,7 +313,6 @@ if sync_btn:
             df_d, df_m = load_yahoo_data(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
             st.session_state.df_daily_corr = df_d
             st.session_state.df_daily = df_m
-            # 同步更新時自動存入本地持久化檔案
             df_d.to_csv(SAVED_DAILY_PATH, index=False)
             df_m.to_csv(SAVED_MONTHLY_PATH, index=False)
             st.toast("✅ 已成功從 Yahoo Finance 同步最新數據並完成本地儲存！", icon="📈")
@@ -558,6 +555,7 @@ if not df_global.empty:
     end_date_str = str(df_global.iloc[-1][date_col_g])[:10]
 
     st.markdown(f"### 📊 績效總覽與撥回機率統計（回測期間：`{start_date_str}` 至 `{end_date_str}`）")
+    st.caption("📌 **Benchmark (BM) 組成說明**：60%全球股 + 40%全球債")
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("策略累積淨值", f"{latest_port_nav:.4f}", f"{total_port_ret:+.1f}%")
@@ -578,6 +576,8 @@ if not df_global.empty:
 
     # 淨值走勢圖
     st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10，含金絲雀避險點標示）")
+    st.caption("💡 註：Benchmark 為 60%全球股 + 40%全球債")
+    
     df_chart = df_monthly_perf.melt(
         id_vars=['Date', 'Canary Status'], 
         value_vars=['Portfolio 淨值', 'Benchmark 淨值'],
@@ -760,7 +760,7 @@ if selected_tab == "1. 資產配置與權重圖":
             
             canary_mom = mom_t0
             if canary_mom <= 0:
-                st.warning(f"🛡️ **觸發避險！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($\le 0$)，系統已自動切換為防禦配置。")
+                st.warning(f"🛡️️ **觸發避險！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($\le 0$)，系統已自動切換為防禦配置。")
             else:
                 st.success(f"🚀 **正常進攻！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($> 0$)，系統進行多重資產動能配置。")
             
