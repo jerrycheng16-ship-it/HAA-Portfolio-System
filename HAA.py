@@ -288,7 +288,7 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式（已更新為指定動能公式）
+# 核心 HAA 配置計算函式
 # -------------------------------------------------------------
 def calc_weights_for_row(target_idx, df):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
@@ -303,7 +303,6 @@ def calc_weights_for_row(target_idx, df):
         p6 = float(df.iloc[target_idx - 6][canary_col])
         p12 = float(df.iloc[target_idx - 12][canary_col])
         
-        # 套用使用者指定公式：((P_t/P_{t-1}-1) + (P_t/P_{t-3}-1) + (P_t/P_{t-6}-1) + (P_t/P_{t-12}-1)) / 4
         canary_mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
     except Exception:
         canary_mom = 0.1
@@ -380,7 +379,8 @@ if len(df_global) > 0:
         "Portfolio 月報酬率 (%)": 0.0,
         "Benchmark 月報酬率 (%)": 0.0,
         "Portfolio 淨值": portfolio_nav,
-        "Benchmark 淨值": benchmark_nav
+        "Benchmark 淨值": benchmark_nav,
+        "Canary Status": "Normal"
     })
 
 for i in range(1, len(df_global)):
@@ -393,8 +393,11 @@ for i in range(1, len(df_global)):
         bm_ret = 0.6 * acwi_ret + 0.4 * agg_ret
     
     port_ret_raw = 0.0
+    canary_status_str = "正常進攻"
     if i - 1 >= 12:
-        weights, _ = calc_weights_for_row(i - 1, df_global)
+        weights, canary_mom = calc_weights_for_row(i - 1, df_global)
+        if canary_mom <= 0:
+            canary_status_str = "避險模式"
         for asset, w in weights.items():
             if w > 0 and asset in df_global.columns:
                 asset_ret = (df_global.iloc[i][asset] / df_global.iloc[i-1][asset]) - 1.0
@@ -440,7 +443,8 @@ for i in range(1, len(df_global)):
         "Portfolio 月報酬率 (%)": round(port_ret_final * 100, 2),
         "Benchmark 月報酬率 (%)": round(bm_ret * 100, 2),
         "Portfolio 淨值": round(portfolio_nav, 4),
-        "Benchmark 淨值": round(benchmark_nav, 4)
+        "Benchmark 淨值": round(benchmark_nav, 4),
+        "Canary Status": canary_status_str
     })
 
 df_monthly_perf = pd.DataFrame(monthly_perf_records)
@@ -478,6 +482,45 @@ if not df_global.empty:
         bm_ytd_ret = total_bm_ret
 
 # -------------------------------------------------------------
+# 🌐 全域月份選擇器（放置於 Tag 分頁上方，影響所有分頁數據呈現）
+# -------------------------------------------------------------
+st.markdown("---")
+if not df_global.empty and len(df_global) >= 12:
+    available_dates = [str(df_global.iloc[i][date_col_g])[:10] for i in range(12, len(df_global))]
+    default_index = len(available_dates) - 1 if len(available_dates) > 0 else 0
+    global_selected_month = st.selectbox("🎯 【全域控制】請選擇檢視/回測月份 (將同步影響各分頁呈現)：", available_dates, index=default_index, key="global_month_selector")
+else:
+    global_selected_month = None
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 美化 Tab 選單 (st.pills)
+# -------------------------------------------------------------
+tab_options = [
+    "1. 資產配置與權重圖", 
+    "2. 金絲雀動能明細", 
+    "3. 📁 月底價格上傳與歷史矩陣", 
+    "4. 📊 每日價格上傳與相關係數矩陣", 
+    "5. 📈 歷史月報酬率與淨值走勢",
+    "6. 🧮 策略月報酬率計算過程核對"
+]
+
+selected_tab = st.pills(
+    "🧭 請選擇功能導覽分頁：", 
+    tab_options, 
+    selection_mode="single",
+    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0]
+)
+
+if selected_tab:
+    st.session_state.tab_selection = selected_tab
+else:
+    selected_tab = st.session_state.tab_selection
+
+st.markdown("---")
+
+# -------------------------------------------------------------
 # 頂部：績效總覽
 # -------------------------------------------------------------
 if not df_global.empty:
@@ -503,10 +546,10 @@ if not df_global.empty:
         st_c3.metric(f"加碼撥回機率 ({rate_high:.1f}%)", f"{prob_high:.1f}%", f"{cnt_high} 個月 / NAV > {t_high}")
         st_c4.metric("總統計月份數", f"{total_payout_months} 個月")
 
-    # 淨值走勢圖
-    st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10）")
+    # 淨值走勢圖 (已加入金絲雀避險訊號標示)
+    st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10，含金絲雀避險點標示）")
     df_chart = df_monthly_perf.melt(
-        id_vars=['Date'], 
+        id_vars=['Date', 'Canary Status'], 
         value_vars=['Portfolio 淨值', 'Benchmark 淨值'],
         var_name='類別', 
         value_name='淨值'
@@ -520,11 +563,20 @@ if not df_global.empty:
         x=alt.X('Date:N', title='月份', axis=alt.Axis(labelAngle=-45, labelFontSize=11, titleFontSize=13)),
         y=alt.Y('淨值:Q', title='累積淨值', scale=alt.Scale(domain=[min_y_limit, max_y_limit])),
         color=alt.Color('類別:N', title='標的', scale=alt.Scale(domain=['Portfolio 淨值', 'Benchmark 淨值'], range=['#2563EB', '#F59E0B'])),
-        tooltip=['Date', '類別', alt.Tooltip('淨值:Q', format='.4f')]
-    ).properties(height=380)
+        tooltip=['Date', '類別', 'Canary Status', alt.Tooltip('淨值:Q', format='.4f')]
+    )
+
+    # 篩選出觸發避險的月份用圓點標示在走勢圖上
+    df_defensive = df_monthly_perf[df_monthly_perf['Canary Status'] == "避險模式"]
+    defensive_points = alt.Chart(df_defensive).mark_point(size=120, color='red', filled=True).encode(
+        x='Date:N',
+        y=alt.Y('Portfolio 淨值:Q'),
+        tooltip=['Date', 'Canary Status', alt.Tooltip('Portfolio 淨值:Q', format='.4f')]
+    )
 
     rule_10 = alt.Chart(pd.DataFrame({'y': [10.0]})).mark_rule(color='#94A3B8', strokeDash=[4, 4]).encode(y='y:Q')
-    st.altair_chart(line_chart + rule_10, use_container_width=True)
+    st.altair_chart((line_chart + defensive_points + rule_10).properties(height=380), use_container_width=True)
+    st.caption("🔴 紅色圓點代表該月份金絲雀訊號觸發避險（防禦模式）。")
 
     # 報酬率比較分析
     st.markdown("### 📈 策略與 Benchmark 報酬率比較分析")
@@ -572,47 +624,18 @@ if not df_global.empty:
 st.markdown("---")
 
 # -------------------------------------------------------------
-# 美化 Tab 選單 (st.pills)
-# -------------------------------------------------------------
-tab_options = [
-    "1. 資產配置與權重圖", 
-    "2. 金絲雀動能明細", 
-    "3. 📁 月底價格上傳與歷史矩陣", 
-    "4. 📊 每日價格上傳與相關係數矩陣", 
-    "5. 📈 歷史月報酬率與淨值走勢",
-    "6. 🧮 策略月報酬率計算過程核對"
-]
-
-selected_tab = st.pills(
-    "🧭 請選擇功能導覽分頁：", 
-    tab_options, 
-    selection_mode="single",
-    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0]
-)
-
-if selected_tab:
-    st.session_state.tab_selection = selected_tab
-else:
-    selected_tab = st.session_state.tab_selection
-
-st.markdown("---")
-
-# -------------------------------------------------------------
-# 各分頁功能實作
+# 各分頁功能實作（採用全域選擇的月份 `global_selected_month`）
 # -------------------------------------------------------------
 if selected_tab == "1. 資產配置與權重圖":
-    st.subheader("當期資產配置、動能分析與三個月配置熱力圖")
+    st.subheader(f"當期資產配置、動能分析與三個月配置熱力圖（依全域選擇月份：{global_selected_month}）")
     df = st.session_state.get("df_daily", pd.DataFrame()).copy()
     
-    if not df.empty and len(df) >= 12:
+    if not df.empty and len(df) >= 12 and global_selected_month:
         date_col = 'Date' if 'Date' in df.columns else df.columns[0]
-        available_dates = [str(df.iloc[i][date_col])[:10] for i in range(12, len(df))]
-        default_index = len(available_dates) - 1 if len(available_dates) > 0 else 0
-        selected_month = st.selectbox("🎯 選擇檢視月份", available_dates, index=default_index, key="tab1_month")
         
         target_idx = -1
         for i in range(12, len(df)):
-            if str(df.iloc[i][date_col])[:10] == selected_month:
+            if str(df.iloc[i][date_col])[:10] == global_selected_month:
                 target_idx = i
                 break
         
@@ -641,7 +664,7 @@ if selected_tab == "1. 資產配置與權重圖":
             df_base = df_plot[["Asset", "Month"]].drop_duplicates().copy()
             df_base["BaseColor"] = "#ffffff"
             
-            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資態配置熱力圖")
+            st.markdown(f"### 📊 選擇月份 ({global_selected_month}) 及其前兩個月之資態配置熱力圖")
             base_layer = alt.Chart(df_base).mark_rect(stroke='#e0e0e0', strokeWidth=1, fill='#ffffff').encode(
                 x=alt.X('Month:N', title='月份', axis=alt.Axis(labelAngle=0, labelFontSize=12, titleFontSize=14)),
                 y=alt.Y('Asset:N', title='資產標的', sort=chart_cols, axis=alt.Axis(labelFontSize=12, titleFontSize=14)),
@@ -814,16 +837,14 @@ elif selected_tab == "5. 📈 歷史月報酬率與淨值走勢":
         st.dataframe(display_df, use_container_width=True)
 
 elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
-    st.subheader("🧮 策略月報酬率計算過程核對（權重 × 單一資產月報酬率 = 加權貢獻）")
+    st.subheader(f"🧮 策略月報酬率計算過程核對（依全域選擇月份：{global_selected_month}）")
     df = st.session_state.get("df_daily", pd.DataFrame()).copy()
     
-    if not df.empty and len(df) > 1:
+    if not df.empty and len(df) > 1 and global_selected_month:
         date_col = 'Date' if 'Date' in df.columns else df.columns[0]
-        available_dates = [str(df.iloc[i][date_col])[:10] for i in range(1, len(df))]
-        selected_month = st.selectbox("🎯 請選擇欲核對的月份", available_dates, index=len(available_dates)-1, key="tab6_month")
         target_idx = -1
         for i in range(1, len(df)):
-            if str(df.iloc[i][date_col])[:10] == selected_month:
+            if str(df.iloc[i][date_col])[:10] == global_selected_month:
                 target_idx = i
                 break
                 
@@ -846,7 +867,7 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
                 check_rows.append({
                     "資產標的": col,
                     f"上月底價格 ({prev_month_label})": round(prev_price, 4),
-                    f"當月底價格 ({selected_month})": round(curr_price, 4),
+                    f"當月底價格 ({global_selected_month})": round(curr_price, 4),
                     "資產月報酬率 (%)": f"{asset_ret * 100:+.2f}%",
                     "期初配置權重 (%)": f"{w * 100:.1f}%",
                     "加權月報酬貢獻 (%)": f"{weighted_contrib * 100:+.4f}%"
@@ -870,7 +891,7 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
             fee_r_m = fee_monthly_rate
             total_calculated_ret_final = total_calculated_ret_raw - fee_r_m - payout_r_m
             
-            st.markdown(f"### 📌 月份：`{selected_month}` 計算結果總覽")
+            st.markdown(f"### 📌 月份：`{global_selected_month}` 計算結果總覽")
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("當月加權未扣費月報酬率", f"{total_calculated_ret_raw * 100:+.2f}%")
             m2.metric("扣費/撥回後實際月報酬率", f"{total_calculated_ret_final * 100:+.2f}%")
