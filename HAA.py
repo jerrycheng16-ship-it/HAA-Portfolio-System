@@ -164,7 +164,7 @@ def clean_dataframe(uploaded_file):
         return None
 
 # -------------------------------------------------------------
-# 初始化 Session State 變數
+# 初始化 Session State 變數（自動讀取上次儲存的自訂資料）
 # -------------------------------------------------------------
 if "df_daily_corr" not in st.session_state:
     st.session_state.df_daily_corr = None
@@ -185,6 +185,7 @@ if "df_daily" not in st.session_state:
             if os.path.exists(SAVED_MONTHLY_PATH):
                 os.remove(SAVED_MONTHLY_PATH)
 
+    # 若磁碟中沒有歷史檔案，則載入預設資料
     if not loaded_from_disk:
         default_excel_data = [
             ['2024-12-31', 455.98969, 578.39697, 470.595, 12911.82031, 1279.98499, 30.4882, 204.17, 1552.3064, 6184.0498, 275.4921, 1661.86304, 897.19098, 6.164, 463.4374, 457.0121, 240.9976, 7090.06982, 119.166, 105.854, 228.65, 1952.8, 463.4374],
@@ -218,7 +219,7 @@ if "df_daily" not in st.session_state:
 # -------------------------------------------------------------
 # 頂部控制項：回測日期與參數設定區
 # -------------------------------------------------------------
-with st.expander("⚙️️ 數據同步區間、費用與階梯撥回率（配息）參數設定區", expanded=True):
+with st.expander("⚙️ 數據同步區間、費用與階梯撥回率（配息）參數設定區", expanded=True):
     col_d1, col_d2, col_btn = st.columns([2, 2, 1])
     with col_d1:
         start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1), key="global_start_date")
@@ -354,7 +355,7 @@ def calc_weights_for_row(target_idx, df):
     return weights, canary_mom
 
 # -------------------------------------------------------------
-# 動態計算每個月報酬率、累積淨值、MDD 與金絲雀狀態
+# 動態計算每個月報酬率、累積淨值與 MDD
 # -------------------------------------------------------------
 df_global = st.session_state.get("df_daily", pd.DataFrame()).copy()
 date_col_g = 'Date' if 'Date' in df_global.columns else (df_global.columns[0] if not df_global.empty else 'Date')
@@ -377,8 +378,7 @@ if len(df_global) > 0:
         "Portfolio 月報酬率 (%)": 0.0,
         "Benchmark 月報酬率 (%)": 0.0,
         "Portfolio 淨值": portfolio_nav,
-        "Benchmark 淨值": benchmark_nav,
-        "Canary_State": "進攻"
+        "Benchmark 淨值": benchmark_nav
     })
 
 for i in range(1, len(df_global)):
@@ -390,13 +390,6 @@ for i in range(1, len(df_global)):
         agg_ret = (df_global.iloc[i][bm_agg_col] / df_global.iloc[i-1][bm_agg_col]) - 1.0
         bm_ret = 0.6 * acwi_ret + 0.4 * agg_ret
     
-    # 計算當期金絲雀狀態
-    canary_is_defensive = False
-    if i - 1 >= 12:
-        _, c_mom = calc_weights_for_row(i - 1, df_global)
-        if c_mom <= 0:
-            canary_is_defensive = True
-
     port_ret_raw = 0.0
     if i - 1 >= 12:
         weights, _ = calc_weights_for_row(i - 1, df_global)
@@ -440,14 +433,12 @@ for i in range(1, len(df_global)):
     if bm_dd < bm_mdd:
         bm_mdd = bm_dd
     
-    state_str = "避險" if canary_is_defensive else "進攻"
     monthly_perf_records.append({
         "Date": curr_date,
         "Portfolio 月報酬率 (%)": round(port_ret_final * 100, 2),
         "Benchmark 月報酬率 (%)": round(bm_ret * 100, 2),
         "Portfolio 淨值": round(portfolio_nav, 4),
-        "Benchmark 淨值": round(benchmark_nav, 4),
-        "Canary_State": state_str
+        "Benchmark 淨值": round(benchmark_nav, 4)
     })
 
 df_monthly_perf = pd.DataFrame(monthly_perf_records)
@@ -510,36 +501,8 @@ if not df_global.empty:
         st_c3.metric(f"加碼撥回機率 ({rate_high:.1f}%)", f"{prob_high:.1f}%", f"{cnt_high} 個月 / NAV > {t_high}")
         st_c4.metric("總統計月份數", f"{total_payout_months} 個月")
 
-    # -------------------------------------------------------------
-    # 📈 每月累積淨值走勢圖（含金絲雀避險期間背景色：綠漲紅跌）
-    # -------------------------------------------------------------
+    # 淨值走勢圖
     st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10）")
-    
-    # 建立避險期間的區間資料供 mark_rect 使用
-    deficiency_intervals = []
-    in_defensive = False
-    start_d = None
-    
-    for idx, row in df_monthly_perf.iterrows():
-        if row["Canary_State"] == "避險":
-            if not in_defensive:
-                in_defensive = True
-                start_d = row["Date"]
-            # 判斷當月 Benchmark 是否上漲 (>=0 綠色，<0 紅色)
-            bm_color = "#22c55e" if row["Benchmark 月報酬率 (%)"] >= 0 else "#ef4444"
-            # 為了讓單月或連續避險都能畫出區間，記錄每個避險月份的起訖
-            deficiency_intervals.append({
-                "Start": row["Date"],
-                "End": row["Date"],
-                "Color": bm_color,
-                "BM_Ret": row["Benchmark 月報酬率 (%)"]
-            })
-        else:
-            in_defensive = False
-
-    df_rect = pd.DataFrame(deficiency_intervals)
-
-    # 淨值折線圖資料
     df_chart = df_monthly_perf.melt(
         id_vars=['Date'], 
         value_vars=['Portfolio 淨值', 'Benchmark 淨值'],
@@ -551,34 +514,15 @@ if not df_global.empty:
     min_y_limit = 8.0  
     max_y_limit = float(np.ceil(max_nav_val + 0.5))
 
-    # 背景色塊層 (mark_rect)
-    if not df_rect.empty:
-        rect_chart = alt.Chart(df_rect).mark_rect(opacity=0.25).encode(
-            x=alt.X('Start:N', title='月份'),
-            x2='End:N',
-            color=alt.Color('Color:N', scale=None),
-            tooltip=[
-                alt.Tooltip('Start:N', title='避險月份'),
-                alt.Tooltip('BM_Ret:Q', title='Benchmark 月報酬率 (%)', format='+.2f')
-            ]
-        )
-    else:
-        rect_chart = alt.Chart(pd.DataFrame()).mark_rect()
-
-    # 淨值折線圖層
     line_chart = alt.Chart(df_chart).mark_line(size=2.5).encode(
         x=alt.X('Date:N', title='月份', axis=alt.Axis(labelAngle=-45, labelFontSize=11, titleFontSize=13)),
         y=alt.Y('淨值:Q', title='累積淨值', scale=alt.Scale(domain=[min_y_limit, max_y_limit])),
         color=alt.Color('類別:N', title='標的', scale=alt.Scale(domain=['Portfolio 淨值', 'Benchmark 淨值'], range=['#2563EB', '#F59E0B'])),
         tooltip=['Date', '類別', alt.Tooltip('淨值:Q', format='.4f')]
-    )
+    ).properties(height=380)
 
     rule_10 = alt.Chart(pd.DataFrame({'y': [10.0]})).mark_rule(color='#94A3B8', strokeDash=[4, 4]).encode(y='y:Q')
-
-    # 疊加圖表 (背景色塊 + 10基準線 + 折線)
-    final_nav_chart = (rect_chart + rule_10 + line_chart).properties(height=380)
-    st.altair_chart(final_nav_chart, use_container_width=True)
-    st.caption("💡 註：圖表背景的半透明色塊代表「金絲雀觸發避險期間」，顏色依當月 Benchmark 表現區分（🟢 綠色代表上漲，🔴 紅色代表下跌）。")
+    st.altair_chart(line_chart + rule_10, use_container_width=True)
 
     # 報酬率比較分析
     st.markdown("### 📈 策略與 Benchmark 報酬率比較分析")
