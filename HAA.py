@@ -467,7 +467,7 @@ elif app_mode == "📊 全球總體經濟數據 (Yahoo & FRED)":
                 tip_col_choice = st.selectbox("選擇 TIP 動能指標", selected_indicators, key="canary_tip")
             with cc2:
                 bm_col_choice = st.selectbox("選擇 Benchmark (BM) 指標", selected_indicators, key="canary_bm")
-            st.caption("💡 規則：當 TIP 指標 < 0 時，次月開始觸發避險；觸發期間若 BM 上漲顯示綠色，下跌顯示紅色。")
+            st.caption("💡 規則：當 TIP 指標數值 < 0 時，次月開始觸發避險；觸發期間若 BM 上漲顯示綠色，下跌顯示紅色。")
 
     if not selected_indicators:
         st.warning("⚠️ 請至少選擇一項指標進行繪圖與編輯！")
@@ -571,12 +571,12 @@ elif app_mode == "📊 全球總體經濟數據 (Yahoo & FRED)":
                         secondary_y=is_secondary
                     )
 
-                # 【關鍵修正】：如果啟用了金絲雀避險背景色塊，改為直接判斷 TIP 指標數值本身 < 0，並自次月開始觸發
+                # 【金絲雀避險色塊繪製邏輯】：當 TIP 指標數值 < 0 時，次月開始觸發避險；BM 上漲綠色、下跌紅色
                 if enable_canary and tip_col_choice:
                     if tip_col_choice in chart_df.columns and bm_col_choice in chart_df.columns:
                         temp_canary = chart_df.copy()
-                        temp_canary['tip_neg'] = temp_canary[tip_col_choice] < 0  # 修正：直接判斷指標數值 < 0
-                        temp_canary['canary_active'] = temp_canary['tip_neg'].shift(1).fillna(False)  # 次月開始生效
+                        temp_canary['tip_neg'] = temp_canary[tip_col_choice] < 0  # 判斷 TIP 指標數值 < 0
+                        temp_canary['canary_active'] = temp_canary['tip_neg'].shift(1).fillna(False)  # 自次月開始觸發
                         temp_canary['bm_return'] = temp_canary[bm_col_choice].pct_change(1)
 
                         dates_list = temp_canary.index.tolist()
