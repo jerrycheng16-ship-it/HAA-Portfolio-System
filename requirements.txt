@@ -6,4 +6,3 @@ feedparser
 openai
 yfinance
 openpyxl
-
