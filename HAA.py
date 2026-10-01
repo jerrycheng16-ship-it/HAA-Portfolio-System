@@ -250,7 +250,7 @@ if "df_daily" not in st.session_state:
 # -------------------------------------------------------------
 # 頂部控制項：回測日期與參數設定區
 # -------------------------------------------------------------
-with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關係數權重邏輯設定區", expanded=True):
+with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關係數權重邏輯設定區", expanded=False):
     col_d1, col_d2, col_btn = st.columns([2, 2, 1])
     with col_d1:
         start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1))
