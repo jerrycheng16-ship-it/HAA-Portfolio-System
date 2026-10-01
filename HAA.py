@@ -75,6 +75,7 @@ TICKER_MAP = {
 
 @st.cache_data(ttl=3600)
 def load_yahoo_data(start_str, end_str):
+    """連線 Yahoo Finance 自動下載美金含息價格之歷史每日與月底數據，並自動由舊到新排序"""
     tickers = list(TICKER_MAP.values())
     df_raw = yf.download(tickers, start=start_str, end=end_str, interval="1d", auto_adjust=True, progress=False)
     
@@ -97,9 +98,11 @@ def load_yahoo_data(start_str, end_str):
     inv_map = {v: k for k, v in TICKER_MAP.items()}
     df_daily = df_daily.rename(columns=inv_map)
     
+    # 確保每日價格依 Date 由舊到新排序
     df_daily['Date_dt'] = pd.to_datetime(df_daily['Date'])
     df_daily = df_daily.sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
     
+    # 取月底價格
     df_monthly = df_daily.groupby(df_daily['Date_dt'].dt.to_period('M')).last().reset_index(drop=True)
     df_monthly['Date'] = df_monthly['Date_dt'].dt.strftime('%Y-%m-%d')
     df_monthly = df_monthly.drop(columns=['Date_dt'])
@@ -108,6 +111,7 @@ def load_yahoo_data(start_str, end_str):
     return df_daily, df_monthly
 
 def clean_dataframe(uploaded_file):
+    """安全解析手動上傳（如 Bloomberg 匯出）之 Excel/CSV 檔案，並自動依日期由舊到新排序"""
     try:
         content_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
         is_csv = hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith('.csv')
@@ -155,6 +159,7 @@ def clean_dataframe(uploaded_file):
             if col != "Date":
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 
+        # 強制依日期由舊到新 (升冪 ascending=True) 排序
         df['Date_tmp'] = pd.to_datetime(df[date_col], errors='coerce')
         df = df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp'])
         
@@ -164,7 +169,7 @@ def clean_dataframe(uploaded_file):
         return None
 
 # -------------------------------------------------------------
-# 初始化 Session State 變數（自動讀取上次儲存的自訂資料）
+# 初始化 Session State 變數
 # -------------------------------------------------------------
 if "df_daily_corr" not in st.session_state:
     st.session_state.df_daily_corr = None
@@ -175,18 +180,15 @@ if "df_daily_corr" not in st.session_state:
             st.session_state.df_daily_corr = None
 
 if "df_daily" not in st.session_state:
-    loaded_from_disk = False
     if os.path.exists(SAVED_MONTHLY_PATH):
         try:
             st.session_state.df_daily = pd.read_csv(SAVED_MONTHLY_PATH)
-            loaded_from_disk = True
-            st.toast("📂 已自動載入上次上傳/儲存的歷史資料！", icon="✅")
+            st.toast("已自動載入上次上傳/儲存的歷史資料！", icon="📂")
         except Exception as e:
             if os.path.exists(SAVED_MONTHLY_PATH):
                 os.remove(SAVED_MONTHLY_PATH)
 
-    # 若磁碟中沒有歷史檔案，則載入預設資料
-    if not loaded_from_disk:
+    if "df_daily" not in st.session_state:
         default_excel_data = [
             ['2024-12-31', 455.98969, 578.39697, 470.595, 12911.82031, 1279.98499, 30.4882, 204.17, 1552.3064, 6184.0498, 275.4921, 1661.86304, 897.19098, 6.164, 463.4374, 457.0121, 240.9976, 7090.06982, 119.166, 105.854, 228.65, 1952.8, 463.4374],
             ['2025-01-31', 471.2955, 582.69897, 515.35199, 13271.37988, 1370.64685, 31.00252, 213.38, 1587.13354, 6037.58008, 277.2163, 1684.67896, 908.19781, 6.216, 466.0748, 467.1058, 259.4889, 7164.22021, 120.691, 106.576, 229.5, 2018.79, 466.0748],
@@ -222,13 +224,13 @@ if "df_daily" not in st.session_state:
 with st.expander("⚙️ 數據同步區間、費用與階梯撥回率（配息）參數設定區", expanded=True):
     col_d1, col_d2, col_btn = st.columns([2, 2, 1])
     with col_d1:
-        start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1), key="global_start_date")
+        start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1))
     with col_d2:
-        end_date = st.date_input("回測結束日期", value=datetime.today(), key="global_end_date")
+        end_date = st.date_input("回測結束日期", value=datetime.today())
     with col_btn:
         st.write("")
         st.write("")
-        sync_btn = st.button("🌐 從 Yahoo 自動同步", type="primary", use_container_width=True, key="sync_btn_main")
+        sync_btn = st.button("🌐 從 Yahoo 自動同步", type="primary", use_container_width=True)
 
     st.markdown("---")
     col_fee, col_payout_chk = st.columns([1, 2])
@@ -273,7 +275,6 @@ if sync_btn:
             st.session_state.df_daily_corr = df_d
             st.session_state.df_daily = df_m
             st.toast("✅ 已成功從 Yahoo Finance 同步最新數據！", icon="📈")
-            st.rerun()
         except Exception as e:
             st.error(f"❌ 數據同步失敗，請檢查日期區間或網路連線：{e}")
 
@@ -287,7 +288,7 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式
+# 核心 HAA 配置計算函式（已更新為指定動能公式）
 # -------------------------------------------------------------
 def calc_weights_for_row(target_idx, df):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
@@ -302,6 +303,7 @@ def calc_weights_for_row(target_idx, df):
         p6 = float(df.iloc[target_idx - 6][canary_col])
         p12 = float(df.iloc[target_idx - 12][canary_col])
         
+        # 套用使用者指定公式：((P_t/P_{t-1}-1) + (P_t/P_{t-3}-1) + (P_t/P_{t-6}-1) + (P_t/P_{t-12}-1)) / 4
         canary_mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
     except Exception:
         canary_mom = 0.1
@@ -570,31 +572,6 @@ if not df_global.empty:
 st.markdown("---")
 
 # -------------------------------------------------------------
-# 全域檢視月份選擇器（獨立於 Tag 之外，影響每一個 Tag）
-# -------------------------------------------------------------
-st.markdown("### 🎯 全域檢視月份設定")
-df_global_check = st.session_state.get("df_daily", pd.DataFrame()).copy()
-if not df_global_check.empty and len(df_global_check) >= 12:
-    date_col = 'Date' if 'Date' in df_global_check.columns else df_global_check.columns[0]
-    available_global_dates = [str(df_global_check.iloc[i][date_col])[:10] for i in range(12, len(df_global_check))]
-    default_global_idx = len(available_global_dates) - 1 if len(available_global_dates) > 0 else 0
-    
-    if "global_selected_month" not in st.session_state or st.session_state.global_selected_month not in available_global_dates:
-        st.session_state.global_selected_month = available_global_dates[default_global_idx]
-
-    selected_month = st.selectbox(
-        "選擇全域檢視月份（此選擇將同步連動下方所有分頁與分析）",
-        available_global_dates,
-        index=available_global_dates.index(st.session_state.global_selected_month),
-        key="global_selected_month_box"
-    )
-    st.session_state.global_selected_month = selected_month
-else:
-    selected_month = None
-
-st.markdown("---")
-
-# -------------------------------------------------------------
 # 美化 Tab 選單 (st.pills)
 # -------------------------------------------------------------
 tab_options = [
@@ -610,8 +587,7 @@ selected_tab = st.pills(
     "🧭 請選擇功能導覽分頁：", 
     tab_options, 
     selection_mode="single",
-    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0],
-    key="main_tab_pills"
+    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0]
 )
 
 if selected_tab:
@@ -622,14 +598,18 @@ else:
 st.markdown("---")
 
 # -------------------------------------------------------------
-# 各分頁功能實作（統一讀取 st.session_state.global_selected_month）
+# 各分頁功能實作
 # -------------------------------------------------------------
 if selected_tab == "1. 資產配置與權重圖":
-    st.subheader("當期資產配置、動機構建與三個月配置熱力圖")
+    st.subheader("當期資產配置、動能分析與三個月配置熱力圖")
     df = st.session_state.get("df_daily", pd.DataFrame()).copy()
     
-    if not df.empty and len(df) >= 12 and selected_month:
+    if not df.empty and len(df) >= 12:
         date_col = 'Date' if 'Date' in df.columns else df.columns[0]
+        available_dates = [str(df.iloc[i][date_col])[:10] for i in range(12, len(df))]
+        default_index = len(available_dates) - 1 if len(available_dates) > 0 else 0
+        selected_month = st.selectbox("🎯 選擇檢視月份", available_dates, index=default_index, key="tab1_month")
+        
         target_idx = -1
         for i in range(12, len(df)):
             if str(df.iloc[i][date_col])[:10] == selected_month:
@@ -719,7 +699,7 @@ if selected_tab == "1. 資產配置與權重圖":
                 })
             st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
     else:
-        st.warning("資料筆數不足 12 筆。")
+        st.warning("資料筆數不足 12 筆，請增加回測時間區間或上傳資料。")
 
 elif selected_tab == "2. 金絲雀動能明細":
     st.subheader("金絲雀歷史價格與動能計算逐筆明細表")
@@ -762,14 +742,13 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
             st.session_state.df_daily = cleaned_df
             cleaned_df.to_csv(SAVED_MONTHLY_PATH, index=False)
             st.success(f"成功載入自訂月底價格檔案，共計 {len(st.session_state.df_daily)} 筆資料，且已自動由舊到新排序！")
-            st.rerun()
 
     st.subheader("步驟二：月底歷史價格矩陣核對與互動編輯")
     edited_df = st.data_editor(st.session_state.get("df_daily", pd.DataFrame()), num_rows="dynamic", key="daily_editor")
     
     col_save, col_reset = st.columns([1, 1])
     with col_save:
-        if st.button("🔄 儲存變更並重新計算策略配置", type="primary", key="save_monthly_btn"):
+        if st.button("🔄 儲存變更並重新計算策略配置", type="primary"):
             date_col_e = edited_df.columns[0]
             edited_df['Date_tmp'] = pd.to_datetime(edited_df[date_col_e], errors='coerce')
             edited_df = edited_df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
@@ -781,7 +760,7 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
             st.rerun()
 
     with col_reset:
-        if st.button("🗑️ 清除自訂檔並重置為系統預設資料", key="reset_monthly_btn"):
+        if st.button("🗑️ 清除自訂檔並重置為系統預設資料"):
             if os.path.exists(SAVED_MONTHLY_PATH):
                 os.remove(SAVED_MONTHLY_PATH)
             if "df_daily" in st.session_state:
@@ -801,7 +780,6 @@ elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
             st.session_state.df_daily_corr = cleaned_daily
             cleaned_daily.to_csv(SAVED_DAILY_PATH, index=False)
             st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料，且已自動由舊到新排序！")
-            st.rerun()
 
     st.subheader("步驟二：每日資產價格矩陣核對區")
     corr_source_df = st.session_state.get("df_daily_corr") if st.session_state.get("df_daily_corr") is not None else st.session_state.get("df_daily", pd.DataFrame())
@@ -839,8 +817,10 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
     st.subheader("🧮 策略月報酬率計算過程核對（權重 × 單一資產月報酬率 = 加權貢獻）")
     df = st.session_state.get("df_daily", pd.DataFrame()).copy()
     
-    if not df.empty and len(df) > 1 and selected_month:
+    if not df.empty and len(df) > 1:
         date_col = 'Date' if 'Date' in df.columns else df.columns[0]
+        available_dates = [str(df.iloc[i][date_col])[:10] for i in range(1, len(df))]
+        selected_month = st.selectbox("🎯 請選擇欲核對的月份", available_dates, index=len(available_dates)-1, key="tab6_month")
         target_idx = -1
         for i in range(1, len(df)):
             if str(df.iloc[i][date_col])[:10] == selected_month:
