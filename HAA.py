@@ -128,11 +128,9 @@ def load_yahoo_data(start_str, end_str):
     inv_map = {v: k for k, v in TICKER_MAP.items()}
     df_daily = df_daily.rename(columns=inv_map)
     
-    # 確保每日價格依 Date 由舊到新排序
     df_daily['Date_dt'] = pd.to_datetime(df_daily['Date'])
     df_daily = df_daily.sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
     
-    # 取月底價格
     df_monthly = df_daily.groupby(df_daily['Date_dt'].dt.to_period('M')).last().reset_index(drop=True)
     df_monthly['Date'] = df_monthly['Date_dt'].dt.strftime('%Y-%m-%d')
     df_monthly = df_monthly.drop(columns=['Date_dt'])
@@ -189,7 +187,6 @@ def clean_dataframe(uploaded_file):
             if col != "Date":
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 
-        # 強制依日期由舊到新 (升冪 ascending=True) 排序
         df['Date_tmp'] = pd.to_datetime(df[date_col], errors='coerce')
         df = df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp'])
         
@@ -199,7 +196,7 @@ def clean_dataframe(uploaded_file):
         return None
 
 # -------------------------------------------------------------
-# 初始化 Session State 變數
+# 初始化 Session State 變數與本地持久化載入
 # -------------------------------------------------------------
 if "df_daily_corr" not in st.session_state:
     st.session_state.df_daily_corr = None
@@ -210,14 +207,16 @@ if "df_daily_corr" not in st.session_state:
             st.session_state.df_daily_corr = None
 
 if "df_daily" not in st.session_state:
+    # 優先從本地持久化儲存讀取月底歷史資料
     if os.path.exists(SAVED_MONTHLY_PATH):
         try:
             st.session_state.df_daily = pd.read_csv(SAVED_MONTHLY_PATH)
-            st.toast("已自動載入上次上傳/儲存的歷史資料！", icon="📂")
-        except Exception as e:
+            st.toast("已自動載入上次儲存的歷史月底資料！", icon="📂")
+        except Exception:
             if os.path.exists(SAVED_MONTHLY_PATH):
                 os.remove(SAVED_MONTHLY_PATH)
 
+    # 若無本地儲存檔，則載入預設模擬資料
     if "df_daily" not in st.session_state:
         default_excel_data = [
             ['2024-12-31', 455.98969, 578.39697, 470.595, 12911.82031, 1279.98499, 30.4882, 204.17, 1552.3064, 6184.0498, 275.4921, 1661.86304, 897.19098, 6.164, 463.4374, 457.0121, 240.9976, 7090.06982, 119.166, 105.854, 228.65, 1952.8, 463.4374],
@@ -316,7 +315,10 @@ if sync_btn:
             df_d, df_m = load_yahoo_data(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
             st.session_state.df_daily_corr = df_d
             st.session_state.df_daily = df_m
-            st.toast("✅ 已成功從 Yahoo Finance 同步最新數據！", icon="📈")
+            # 同步更新時自動存入本地持久化檔案
+            df_d.to_csv(SAVED_DAILY_PATH, index=False)
+            df_m.to_csv(SAVED_MONTHLY_PATH, index=False)
+            st.toast("✅ 已成功從 Yahoo Finance 同步最新數據並完成本地儲存！", icon="📈")
         except Exception as e:
             st.error(f"❌ 數據同步失敗，請檢查日期區間或網路連線：{e}")
 
@@ -338,6 +340,11 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
     bond_col = next((c for c in cols if "TREASURY" in str(c).upper() or "7-10" in str(c)), cols[-2] if len(cols) >= 2 else cols[0])
     cash_col = next((c for c in cols if "T BILL" in str(c).upper() or "BIL" in str(c).upper()), cols[-1])
     
+    weights = {col: 0.0 for col in df.columns if col != "Date"}
+    if target_idx < 12:
+        weights[cash_col] = 1.0
+        return weights, 0.0
+
     try:
         curr_val = float(df.iloc[target_idx][canary_col])
         p1 = float(df.iloc[target_idx - 1][canary_col])
@@ -349,8 +356,6 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
     except Exception:
         canary_mom = 0.1
         
-    weights = {col: 0.0 for col in df.columns if col != "Date"}
-    
     bond_mom = 0.0
     try:
         b_curr = float(df.iloc[target_idx][bond_col])
@@ -396,13 +401,11 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
         for rank_idx, item in enumerate(valid_selected):
             weights[item["col"]] = (K - rank_idx) / S
             
-        # --- 權重限制邏輯 ---
         hy_col = next((c for c in weights if str(c).strip().upper() == "HY"), None)
         embi_col = next((c for c in weights if str(c).strip().upper() == "EMBI"), None)
         embi_corp_col = next((c for c in weights if "EMBI CORP" in str(c).strip().upper() or "CEMB" in str(c).strip().upper()), None)
         
         excess = 0.0
-        
         if hy_col and weights[hy_col] > 0.10:
             excess += weights[hy_col] - 0.10
             weights[hy_col] = 0.10
@@ -453,7 +456,7 @@ for i in range(1, len(df_global)):
     curr_date = str(df_global.iloc[i][date_col_g])[:10]
     
     bm_ret = 0.0
-    if bm_acwi_col and bm_agg_col:
+    if bm_acwi_col and bm_agg_col and bm_acwi_col in df_global.columns and bm_agg_col in df_global.columns:
         acwi_ret = (df_global.iloc[i][bm_acwi_col] / df_global.iloc[i-1][bm_acwi_col]) - 1.0
         agg_ret = (df_global.iloc[i][bm_agg_col] / df_global.iloc[i-1][bm_agg_col]) - 1.0
         bm_ret = 0.6 * acwi_ret + 0.4 * agg_ret
@@ -830,7 +833,7 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
         if cleaned_df is not None:
             st.session_state.df_daily = cleaned_df
             cleaned_df.to_csv(SAVED_MONTHLY_PATH, index=False)
-            st.success(f"成功載入自訂月底價格檔案，共計 {len(st.session_state.df_daily)} 筆資料，且已自動由舊到新排序！")
+            st.success(f"成功載入自訂月底價格檔案，共計 {len(cleaned_df)} 筆資料，且已自動由舊到新排序並永久儲存！")
 
     st.subheader("步驟二：月底歷史價格矩陣核對與互動編輯")
     edited_df = st.data_editor(st.session_state.get("df_daily", pd.DataFrame()), num_rows="dynamic", key="daily_editor")
@@ -844,7 +847,7 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
             
             st.session_state.df_daily = edited_df
             edited_df.to_csv(SAVED_MONTHLY_PATH, index=False)
-            st.success("已成功儲存變更至本地，並更新策略配置！")
+            st.success("已成功儲存變更至本地檔案，並更新策略配置！")
             st.session_state.tab_selection = "1. 資產配置與權重圖"
             st.rerun()
 
@@ -868,7 +871,7 @@ elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
         if cleaned_daily is not None:
             st.session_state.df_daily_corr = cleaned_daily
             cleaned_daily.to_csv(SAVED_DAILY_PATH, index=False)
-            st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料，且已自動由舊到新排序！")
+            st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料，且已自動由舊到新排序並永久儲存！")
 
     st.subheader("步驟二：每日資產價格矩陣核對區")
     corr_source_df = st.session_state.get("df_daily_corr") if st.session_state.get("df_daily_corr") is not None else st.session_state.get("df_daily", pd.DataFrame())
