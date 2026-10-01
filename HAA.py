@@ -482,46 +482,7 @@ if not df_global.empty:
         bm_ytd_ret = total_bm_ret
 
 # -------------------------------------------------------------
-# 🌐 全域月份選擇器（放置於 Tag 分頁上方，影響所有分頁數據呈現）
-# -------------------------------------------------------------
-st.markdown("---")
-if not df_global.empty and len(df_global) >= 12:
-    available_dates = [str(df_global.iloc[i][date_col_g])[:10] for i in range(12, len(df_global))]
-    default_index = len(available_dates) - 1 if len(available_dates) > 0 else 0
-    global_selected_month = st.selectbox("🎯 【全域控制】請選擇檢視/回測月份 (將同步影響各分頁呈現)：", available_dates, index=default_index, key="global_month_selector")
-else:
-    global_selected_month = None
-
-st.markdown("---")
-
-# -------------------------------------------------------------
-# 美化 Tab 選單 (st.pills)
-# -------------------------------------------------------------
-tab_options = [
-    "1. 資產配置與權重圖", 
-    "2. 金絲雀動能明細", 
-    "3. 📁 月底價格上傳與歷史矩陣", 
-    "4. 📊 每日價格上傳與相關係數矩陣", 
-    "5. 📈 歷史月報酬率與淨值走勢",
-    "6. 🧮 策略月報酬率計算過程核對"
-]
-
-selected_tab = st.pills(
-    "🧭 請選擇功能導覽分頁：", 
-    tab_options, 
-    selection_mode="single",
-    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0]
-)
-
-if selected_tab:
-    st.session_state.tab_selection = selected_tab
-else:
-    selected_tab = st.session_state.tab_selection
-
-st.markdown("---")
-
-# -------------------------------------------------------------
-# 頂部：績效總覽
+# 📈 績效總覽、走勢圖與報酬率比較（已移動至全域月份選擇器上方）
 # -------------------------------------------------------------
 if not df_global.empty:
     start_date_str = str(df_global.iloc[0][date_col_g])[:10]
@@ -608,10 +569,12 @@ if not df_global.empty:
 
     with col_bar2:
         st.subheader(f"📌 今年 ({current_year}) YTD 累積報酬率比較 (%)")
-        df_ytd_bar = pd.DataFrame({
-            "指標": ["HAA 策略", "Benchmark (股6債4)"],
-            "YTD 報酬率 (%)": [round(port_ytd_ret, 2), round(bm_ytd_ret, 2)]
-        })
+        df_ytd_bar = pd.DataFrame(
+            {
+                "指標": ["HAA 策略", "Benchmark (股6債4)"],
+                "YTD 報酬率 (%)": [round(port_ytd_ret, 2), round(bm_ytd_ret, 2)]
+            }
+        )
         
         bar_ytd = alt.Chart(df_ytd_bar).mark_bar(width=60).encode(
             x=alt.X('指標:N', title=None, sort=['HAA 策略', 'Benchmark (股6債4)'], axis=alt.Axis(labelAngle=0, labelLimit=250)),
@@ -620,6 +583,44 @@ if not df_global.empty:
             tooltip=['指標', alt.Tooltip('YTD 報酬率 (%):Q', format='.2f')]
         ).properties(height=300)
         st.altair_chart(bar_ytd, use_container_width=True)
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 🌐 全域月份選擇器（放置於總覽圖表下方、Tab 分頁上方）
+# -------------------------------------------------------------
+if not df_global.empty and len(df_global) >= 12:
+    available_dates = [str(df_global.iloc[i][date_col_g])[:10] for i in range(12, len(df_global))]
+    default_index = len(available_dates) - 1 if len(available_dates) > 0 else 0
+    global_selected_month = st.selectbox("🎯 【全域控制】請選擇檢視/回測月份 (將同步影響各分頁呈現)：", available_dates, index=default_index, key="global_month_selector")
+else:
+    global_selected_month = None
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 美化 Tab 選單 (st.pills)
+# -------------------------------------------------------------
+tab_options = [
+    "1. 資產配置與權重圖", 
+    "2. 金絲雀動能明細", 
+    "3. 📁 月底價格上傳與歷史矩陣", 
+    "4. 📊 每日價格上傳與相關係數矩陣", 
+    "5. 📈 歷史月報酬率與淨值走勢",
+    "6. 🧮 策略月報酬率計算過程核對"
+]
+
+selected_tab = st.pills(
+    "🧭 請選擇功能導覽分頁：", 
+    tab_options, 
+    selection_mode="single",
+    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0]
+)
+
+if selected_tab:
+    st.session_state.tab_selection = selected_tab
+else:
+    selected_tab = st.session_state.tab_selection
 
 st.markdown("---")
 
