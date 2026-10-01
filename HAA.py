@@ -340,7 +340,6 @@ else:
     if df_global is None or df_global.empty:
         df_global = default_df
 
-# 確保第一欄或名稱包含 date 的欄位統一命名為 'Date'
 if not df_global.empty:
     date_candidates = [c for c in df_global.columns if 'date' in str(c).lower()]
     if date_candidates:
@@ -357,7 +356,7 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式
+# 核心 HAA 配置計算函式 (具備安全索引防護)
 # -------------------------------------------------------------
 def calc_weights_for_row(target_idx, df, reverse_flag=True):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
@@ -365,6 +364,13 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
     bond_col = next((c for c in cols if "TREASURY" in str(c).upper() or "7-10" in str(c)), cols[-2] if len(cols) >= 2 else cols[0])
     cash_col = next((c for c in cols if "T BILL" in str(c).upper() or "BIL" in str(c).upper()), cols[-1])
     
+    weights = {col: 0.0 for col in df.columns if col != "Date"}
+    
+    # 防禦：若回溯索引小於 12，直接給予全現金/全債避險權重
+    if target_idx < 12:
+        weights[cash_col] = 1.0
+        return weights, 0.0
+
     try:
         curr_val = float(df.iloc[target_idx][canary_col])
         p1 = float(df.iloc[target_idx - 1][canary_col])
@@ -376,8 +382,6 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
     except Exception:
         canary_mom = 0.1
         
-    weights = {col: 0.0 for col in df.columns if col != "Date"}
-    
     bond_mom = 0.0
     try:
         b_curr = float(df.iloc[target_idx][bond_col])
