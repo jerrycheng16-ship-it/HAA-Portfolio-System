@@ -482,7 +482,7 @@ if not df_global.empty:
         bm_ytd_ret = total_bm_ret
 
 # -------------------------------------------------------------
-# 📈 績效總覽、走勢圖與報酬率比較（已移動至全域月份選擇器上方）
+# 📈 績效總覽、走勢圖與報酬率比較
 # -------------------------------------------------------------
 if not df_global.empty:
     start_date_str = str(df_global.iloc[0][date_col_g])[:10]
@@ -507,7 +507,7 @@ if not df_global.empty:
         st_c3.metric(f"加碼撥回機率 ({rate_high:.1f}%)", f"{prob_high:.1f}%", f"{cnt_high} 個月 / NAV > {t_high}")
         st_c4.metric("總統計月份數", f"{total_payout_months} 個月")
 
-    # 淨值走勢圖 (已加入金絲雀避險訊號標示)
+    # 淨值走勢圖
     st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10，含金絲雀避險點標示）")
     df_chart = df_monthly_perf.melt(
         id_vars=['Date', 'Canary Status'], 
@@ -527,7 +527,6 @@ if not df_global.empty:
         tooltip=['Date', '類別', 'Canary Status', alt.Tooltip('淨值:Q', format='.4f')]
     )
 
-    # 篩選出觸發避險的月份用圓點標示在走勢圖上
     df_defensive = df_monthly_perf[df_monthly_perf['Canary Status'] == "避險模式"]
     defensive_points = alt.Chart(df_defensive).mark_point(size=120, color='red', filled=True).encode(
         x='Date:N',
@@ -587,7 +586,7 @@ if not df_global.empty:
 st.markdown("---")
 
 # -------------------------------------------------------------
-# 🌐 全域月份選擇器（放置於總覽圖表下方、Tab 分頁上方）
+# 🌐 全域月份選擇器
 # -------------------------------------------------------------
 if not df_global.empty and len(df_global) >= 12:
     available_dates = [str(df_global.iloc[i][date_col_g])[:10] for i in range(12, len(df_global))]
@@ -625,7 +624,7 @@ else:
 st.markdown("---")
 
 # -------------------------------------------------------------
-# 各分頁功能實作（採用全域選擇的月份 `global_selected_month`）
+# 各分頁功能實作
 # -------------------------------------------------------------
 if selected_tab == "1. 資產配置與權重圖":
     st.subheader(f"當期資產配置、動能分析與三個月配置熱力圖（依全域選擇月份：{global_selected_month}）")
@@ -794,7 +793,7 @@ elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
 
 elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
     st.subheader("步驟一：上傳 Bloomberg / 自訂每日資產價格檔案")
-    st.info("💡 上傳含每日價格的 Excel 或 CSV 檔案，系統將自動計算日報酬率及資產間的真實相關係數。")
+    st.info("💡 上傳含每日價格的 Excel 或 CSV 檔案，系統將自動計算前六個月日報酬率及資產間的真實相關係數。")
     
     daily_uploaded_file = st.file_uploader("請選擇每日價格檔案 (支援 Excel 或 CSV)", type=["csv", "xlsx", "xls", "xlsm"], key="daily_corr_uploader")
     
@@ -810,16 +809,29 @@ elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
     st.dataframe(corr_source_df, use_container_width=True)
 
     if not corr_source_df.empty:
-        st.subheader("步驟三：相關係數矩陣與平均相關係數核對區")
+        st.subheader(f"步驟三：相關係數矩陣與平均相關係數核對區（依全域選擇月份：`{global_selected_month}` 回推前六個月每日資料計算）")
         act_cols = [c for c in corr_source_df.columns if is_active_asset(c)]
         
         if len(act_cols) > 0:
-            if st.session_state.get("df_daily_corr") is not None:
-                st.success("✅ 已根據上圖每日價格資料計算真實資產間相關係數矩陣：")
-                daily_returns = corr_source_df[act_cols].pct_change().dropna()
+            temp_df = corr_source_df.copy()
+            date_c = 'Date' if 'Date' in temp_df.columns else temp_df.columns[0]
+            temp_df['Date_dt'] = pd.to_datetime(temp_df[date_c], errors='coerce')
+            temp_df = temp_df.dropna(subset=['Date_dt']).sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
+            
+            if global_selected_month:
+                sel_dt = pd.to_datetime(global_selected_month)
+                # 找出小於或等於選定月份月底的資料，並往前取最近 6 個月（約 126 個交易日）
+                mask = temp_df['Date_dt'] <= sel_dt
+                df_filtered = temp_df[mask].tail(126).copy()
+            else:
+                df_filtered = temp_df.tail(126).copy()
+
+            if st.session_state.get("df_daily_corr") is not None and not df_filtered.empty:
+                st.success(f"✅ 已成功抓取截至 `{global_selected_month}` 前 6 個月內的每日交易日資料（共 {len(df_filtered)} 筆）計算真實相關係數矩陣：")
+                daily_returns = df_filtered[act_cols].pct_change().dropna()
                 calc_corr = daily_returns.corr()
             else:
-                st.caption("📌 目前使用預設資料展示相關係數。")
+                st.caption(f"📌 提示：在 `{global_selected_month}` 找不到足夠的前 6 個月每日交易日明細，目前使用預設模擬資料展示。")
                 corr_vals = np.random.uniform(0.2, 0.8, (len(act_cols), len(act_cols)))
                 np.fill_diagonal(corr_vals, 1.00)
                 calc_corr = pd.DataFrame(corr_vals, index=act_cols, columns=act_cols)
