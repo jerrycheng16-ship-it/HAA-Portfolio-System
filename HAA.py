@@ -69,7 +69,7 @@ with st.expander("📖 點擊展開：HAA 多重資產動態配置模型邏輯�
     #### 2. 系統運作核心架構
     * **金絲雀防禦檢視**：以 TIP（美國通膨保護債券）的動能公式進行計算。若 $\\text{Momentum} > 0$ 進入進攻模式；若 $\\le 0$ 則進入避險模式（轉入長債 Treasury 或現金 T Bill）。
     * **多重資產篩選**：計算所有風險資產的綜合動能，過濾掉動能 $\\le 0$ 的標的，取動能表現最佳的**前 7 大標的**。
-    * **相關係數權重配置**：依據資產間的平均相關係數（$\\text{avgCorr}$）進行金字塔給權。可由側邊欄切換「低相關優先」或「高相關優先」。
+    * **權重配置模式**：可由下方設定選擇「低相關優先」、「高相關優先」或「平均權重（Equal Weight）」。
     * **部位上限控管**：
       * `HY` 權重上限為 **10%**。
       * `HY` + `EMBI` + `EMBI Corp` 三者總和上限為 **20%**。
@@ -261,15 +261,18 @@ with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關�
 
     st.markdown("---")
     
-    st.markdown("#### 🔗 相關係數權重分配邏輯設定")
-    corr_logic_choice = st.radio(
-        "請選擇相關係數與資產權重高低的對應關係：",
-        ("相關性越小，權重越高（低相關優先配置）", "相關性越大，權重越高（高相關優先配置）"),
+    st.markdown("#### 🔗 權重配置模式設定")
+    weight_logic_choice = st.radio(
+        "請選擇前 7 大動能資產的權重配置方式：",
+        ("低相關優先配置（相關性越小權重越高）", "高相關優先配置（相關性越大權重越高）", "平均權重（Equal Weight，前7大資產均分權重）"),
         index=0,
-        key="corr_logic_radio",
+        key="weight_logic_radio",
         horizontal=True
     )
-    reverse_flag = True if "越大" in corr_logic_choice else False
+    
+    # 根據選擇決定權重計算參數
+    is_equal_weight = "平均權重" in weight_logic_choice
+    reverse_flag = True if "高相關" in weight_logic_choice else False
 
     st.markdown("---")
     col_fee, col_payout_chk = st.columns([1, 2])
@@ -329,9 +332,9 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式 (含權重限制與相關係數排序方向)
+# 核心 HAA 配置計算函式 (支援等權重 / 金字塔相關係數給權)
 # -------------------------------------------------------------
-def calc_weights_for_row(target_idx, df, reverse_flag=True):
+def calc_weights_for_row(target_idx, df, reverse_flag=True, is_equal_weight=False):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
     canary_col = next((c for c in cols if "TIP" in str(c).upper() or "ICETIP" in str(c).upper()), cols[-3] if len(cols) >= 3 else cols[0])
     bond_col = next((c for c in cols if "TREASURY" in str(c).upper() or "7-10" in str(c)), cols[-2] if len(cols) >= 2 else cols[0])
@@ -391,12 +394,19 @@ def calc_weights_for_row(target_idx, df, reverse_flag=True):
         active_results.sort(key=lambda x: x["mom"], reverse=True)
         valid_selected = [item for item in active_results if item["mom"] > 0][:7]
         
-        valid_selected.sort(key=lambda x: x["avgCorr"], reverse=reverse_flag)
-        
         K = len(valid_selected)
-        S = K * (K + 1) / 2 if K > 0 else 1
-        for rank_idx, item in enumerate(valid_selected):
-            weights[item["col"]] = (K - rank_idx) / S
+        if K > 0:
+            if is_equal_weight:
+                # 平均權重（Equal Weight）
+                eq_weight = 1.0 / K
+                for item in valid_selected:
+                    weights[item["col"]] = eq_weight
+            else:
+                # 相關係數金字塔給權
+                valid_selected.sort(key=lambda x: x["avgCorr"], reverse=reverse_flag)
+                S = K * (K + 1) / 2
+                for rank_idx, item in enumerate(valid_selected):
+                    weights[item["col"]] = (K - rank_idx) / S
             
         hy_col = next((c for c in weights if str(c).strip().upper() == "HY"), None)
         embi_col = next((c for c in weights if str(c).strip().upper() == "EMBI"), None)
@@ -461,7 +471,7 @@ for i in range(1, len(df_global)):
     port_ret_raw = 0.0
     canary_status_str = "正常進攻"
     if i - 1 >= 12:
-        weights, canary_mom = calc_weights_for_row(i - 1, df_global, reverse_flag)
+        weights, canary_mom = calc_weights_for_row(i - 1, df_global, reverse_flag, is_equal_weight)
         if canary_mom <= 0:
             canary_status_str = "避險模式"
         for asset, w in weights.items():
@@ -713,9 +723,9 @@ if selected_tab == "1. 資產配置與權重圖":
             idx_t1 = max(12, target_idx - 1)
             idx_t0 = target_idx
             
-            w_t2, mom_t2 = calc_weights_for_row(idx_t2, df, reverse_flag)
-            w_t1, mom_t1 = calc_weights_for_row(idx_t1, df, reverse_flag)
-            w_t0, mom_t0 = calc_weights_for_row(idx_t0, df, reverse_flag)
+            w_t2, mom_t2 = calc_weights_for_row(idx_t2, df, reverse_flag, is_equal_weight)
+            w_t1, mom_t1 = calc_weights_for_row(idx_t1, df, reverse_flag, is_equal_weight)
+            w_t0, mom_t0 = calc_weights_for_row(idx_t0, df, reverse_flag, is_equal_weight)
             
             label_t2 = str(df.iloc[idx_t2][date_col])[:10]
             label_t1 = str(df.iloc[idx_t1][date_col])[:10]
@@ -760,7 +770,7 @@ if selected_tab == "1. 資產配置與權重圖":
             
             canary_mom = mom_t0
             if canary_mom <= 0:
-                st.warning(f"🛡️️ **觸發避險！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($\le 0$)，系統已自動切換為防禦配置。")
+                st.warning(f"🛡️ **觸發避險！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($\le 0$)，系統已自動切換為防禦配置。")
             else:
                 st.success(f"🚀 **正常進攻！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($> 0$)，系統進行多重資產動能配置。")
             
@@ -931,7 +941,7 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
                 
         if target_idx != -1:
             prev_month_label = str(df.iloc[target_idx - 1][date_col])[:10]
-            weights, canary_mom = calc_weights_for_row(target_idx - 1, df, reverse_flag) if target_idx - 1 >= 12 else ({col: 0.0 for col in df.columns if col != "Date"}, 0.1)
+            weights, canary_mom = calc_weights_for_row(target_idx - 1, df, reverse_flag, is_equal_weight) if target_idx - 1 >= 12 else ({col: 0.0 for col in df.columns if col != "Date"}, 0.1)
             
             check_rows = []
             total_calculated_ret_raw = 0.0
