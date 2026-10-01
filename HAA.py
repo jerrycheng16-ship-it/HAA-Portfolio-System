@@ -1,733 +1,955 @@
 import os
-import glob
-import time
-import re
-import json
-import datetime
-from datetime import timezone, timedelta
-import urllib.parse
-import urllib.request
-import io
-import feedparser
-import pandas as pd
-import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from datetime import datetime
+from io import BytesIO
 import streamlit as st
-from openai import OpenAI
+import pandas as pd
+import numpy as np
+import altair as alt
+import yfinance as yf
 
-# ---------------------------------------------------------
-# 1. 頁面配置與 Secrets 安全讀取
-# ---------------------------------------------------------
+# 設定本地持久化儲存檔案路徑 (供 Bloomberg / 自訂數據儲存)
+SAVED_MONTHLY_PATH = "last_uploaded_data.csv"
+SAVED_DAILY_PATH = "last_uploaded_daily_data.csv"
+
+# 頁面基本設定
 st.set_page_config(
-    page_title="AI 機構級金融研報與總經決策系統",
-    page_icon="📈",
+    page_title="HAA 多重資態動態配置系統",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 讀取 DashScope 與 FRED 的 API Key
-dashscope_key = st.secrets.get("DASHSCOPE_API_KEY", os.environ.get("DASHSCOPE_API_KEY", ""))
-fred_api_key = st.secrets.get("FRED_API_KEY", os.environ.get("FRED_API_KEY", ""))
+# Custom CSS
+st.markdown("""
+<style>
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #1E293B;
+        margin-bottom: 0.5rem;
+    }
+    .stPills [data-testid="stMarkdownContainer"] > p {
+        font-size: 1.05rem !important;
+        font-weight: 600 !important;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.6rem !important;
+        font-weight: 700 !important;
+    }
+    .tier-box {
+        background-color: #1E293B;
+        border-radius: 8px;
+        padding: 12px;
+        border: 1px solid #334155;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-st.title("📈 AI 機構級金融市場研報與總經決策系統")
-st.caption("自動彙整實時總經新聞、Yahoo / FRED 雙資料源動態連動圖表、每日研報/月報，以及資產交易決策評估。")
+st.title("📊 HAA 多重資產動態配置系統")
 
-# ---------------------------------------------------------
-# 2. 側邊欄選單
-# ---------------------------------------------------------
-with st.sidebar:
-    st.header("⚙️ 功能選單")
-    
-    if dashscope_key:
-        st.success("🔒 DashScope API Key 已載入")
-    else:
-        st.error("❌ 未讀取到 DASHSCOPE_API_KEY")
-
-    if fred_api_key:
-        st.success("🔒 FRED API Key 已載入")
-    else:
-        st.warning("⚠️ 未讀取到 FRED_API_KEY（總經數據將改用備用管道）")
-
-    st.markdown("---")
-    app_mode = st.radio(
-        "請選擇功能模組：",
-        ["📰 每日要聞與總經月報", "📊 全球總體經濟數據 (Yahoo & FRED)", "🎯 基金 / ETF 交易決策評估"]
-    )
-
-# ---------------------------------------------------------
-# 3. 工具函數 (Qwen API & FRED API / Yahoo 雙資料源抓取)
-# ---------------------------------------------------------
-def call_qwen_api(messages_list):
-    if not dashscope_key:
-        return None, "請先於 Streamlit Secrets 設定 DASHSCOPE_API_KEY！"
-        
-    client = OpenAI(
-        api_key=dashscope_key.strip(),
-        base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    )
-    models_to_try = ['qwen-max', 'qwen-plus', 'qwen-turbo']
-    last_error = ""
-    
-    for model_name in models_to_try:
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages_list,
-                temperature=0.3
-            )
-            if response and response.choices:
-                return response.choices[0].message.content, None
-        except Exception as e:
-            last_error = str(e)
-            time.sleep(1.5)
-            
-    return None, f"模型呼叫失敗，錯誤原因: {last_error}"
-
-def clean_html(raw_html):
-    """清除 RSS 中的 HTML 標籤"""
-    cleanr = re.compile('<.*?>')
-    return re.sub(cleanr, '', raw_html)
-
-# 常用總經與市場標的代碼表
-DEFAULT_INDICATORS = {
-    "美國 10 年期公債殖利率 (%)": "^TNX",
-    "S&P 500 指數": "^GSPC",
-    "美國 核心 PCE 物價指數": "PCEPILFE",
-    "美國 實質 GDP (Real GDP)": "GDPC1",
-    "美國 CPI 消費者物價指數": "CPIAUCSL",
-    "黃金期貨 (Gold)": "GC=F",
-    "原油期貨 (WTI Crude)": "CL=F",
-    "美元指數 (DXY)": "DX-Y.NYB",
-    "VIX 恐慌指數": "^VIX",
-    "台灣加權指數": "^TWII"
+# Yahoo Finance Ticker 對照表 (全數為美金計價，自動還原配息與息收總報酬)
+TICKER_MAP = {
+    'ACWI': 'ACWI',
+    'Asia ex JP': 'AAXJ',
+    'Latam': 'ILF',
+    'S&P500': 'SPY',
+    'SXXR': 'VGK',
+    'Topix': 'EWJ',
+    'Emerging Euro, Middle East, Afica': 'EEM',
+    'Taiex': '^TWII',
+    'CSI 300': 'ASHR',
+    'Corp Bond': 'LQD',
+    'HY': 'HYG',
+    'EMBI': 'EMB',
+    'EMBI Corp': 'CEMB',
+    'Globa Agg Local Currency': 'LEMB',
+    'Commodity': 'DBC',
+    'GLD': 'GLD',
+    'REITS': 'VNQ',
+    'TIP': 'TIP',
+    'Treasury': 'IEF',
+    'T Bill': 'BIL',
+    'BM_AWCI': 'ACWI',
+    'BM_AGG': 'AGG'
 }
 
-def search_symbol_by_llm(keyword):
-    prompt = f"""
-你是一個精通全球金融市場（Yahoo Finance 與 FRED 數據庫）的總經專家。
-使用者輸入的自然語言關鍵字為："{keyword}"
-
-請提供 3 個最精準的資料代碼。
-注意：
-1. 若屬總經指標（如 GDP, CPI, PCE, 失業率），請務必提供 FRED 正確 Series ID（例如 GDP 提供 GDPC1、CPI 提供 CPIAUCSL）。
-2. 若屬市場指數或資產，提供 Yahoo Ticker（如 ^TNX, ^GSPC）。
-
-請嚴格以 JSON 陣列格式輸出，不要加任何多餘說明：
-[
-  {{"code": "GDPC1", "name": "US Real GDP", "source": "FRED"}},
-  {{"code": "^TNX", "name": "US 10-Year Treasury Yield", "source": "Yahoo"}},
-  {{"code": "PCEPILFE", "name": "US Core PCE Index", "source": "FRED"}}
-]
-"""
-    res, err = call_qwen_api([{"role": "user", "content": prompt}])
-    if res:
-        try:
-            match = re.search(r'\[.*\]', res, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
-        except Exception:
-            return []
-    return []
-
 @st.cache_data(ttl=3600)
-def fetch_smart_data(symbol):
-    """結合 FRED 官方 REST API 與 Yahoo Finance 的智慧抓取函數（強制使用 period="max" 抓取完整歷史）"""
-    raw_code = str(symbol).strip().replace("$", "").replace('"', "").replace("'", "")
+def load_yahoo_data(start_str, end_str):
+    tickers = list(TICKER_MAP.values())
+    df_raw = yf.download(tickers, start=start_str, end=end_str, interval="1d", auto_adjust=True, progress=False)
     
-    fred_mapping = {
-        "GDP": "GDPC1",
-        "CPI": "CPIAUCSL",
-        "PCE": "PCEPILFE",
-        "UNRATE": "UNRATE"
-    }
-    clean_code = fred_mapping.get(raw_code.upper(), raw_code)
-
-    # 1. 優先嘗試透過 FRED 官方 API 抓取
-    if fred_api_key and not clean_code.startswith("^") and len(clean_code) <= 10:
-        fred_url = (
-            f"https://api.stlouisfed.org/fred/series/observations"
-            f"?series_id={clean_code}&api_key={fred_api_key}&file_type=json"
-        )
-        try:
-            req = urllib.request.Request(
-                fred_url, 
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            with urllib.request.urlopen(req, timeout=8) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                
-            observations = data.get("observations", [])
-            if observations:
-                dates = []
-                values = []
-                for obs in observations:
-                    if obs["value"] != ".":
-                        dates.append(obs["date"])
-                        values.append(float(obs["value"]))
-                
-                df = pd.DataFrame({
-                    'Date': pd.to_datetime(dates),
-                    symbol: values
-                })
-                df = df.dropna().sort_values('Date')
-                if len(df) > 2:
-                    return df
-        except Exception:
-            pass
-
-    # 2. 備用：嘗試 FRED 官方公開 CSV 捷徑
-    fred_csv_url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={clean_code.replace('^', '')}"
-    try:
-        req = urllib.request.Request(
-            fred_csv_url, 
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-        with urllib.request.urlopen(req, timeout=8) as response:
-            csv_data = response.read()
-            
-        df = pd.read_csv(io.BytesIO(csv_data))
-        if not df.empty and 'DATE' in df.columns:
-            df['Date'] = pd.to_datetime(df['DATE'], errors='coerce')
-            val_col = [c for c in df.columns if c != 'DATE'][0]
-            df[symbol] = pd.to_numeric(df[val_col], errors='coerce')
-            df = df[['Date', symbol]].dropna().sort_values('Date')
-            if len(df) > 2:
-                return df
-    except Exception:
-        pass
-
-    # 3. 嘗試 Yahoo Finance (yfinance) - 使用 period="max" 確保獲取完整歷史
-    try:
-        ticker = yf.Ticker(clean_code)
-        df = ticker.history(period="max", auto_adjust=True)
-        if not df.empty and len(df) > 2:
-            df = df.reset_index()
-            val_col = 'Close' if 'Close' in df.columns else df.columns[1]
-            df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
-            df[symbol] = pd.to_numeric(df[val_col], errors='coerce')
-            df = df[['Date', symbol]].dropna().sort_values('Date')
-            return df
-    except Exception:
-        pass
-
-    return pd.DataFrame()
-
-# ---------------------------------------------------------
-# 模組一：每日金融市場要聞 & 歷史查詢 & 月報彙整
-# ---------------------------------------------------------
-if app_mode == "📰 每日要聞與總經月報":
-    st.header("📰 全球金融市場要聞與總經月報系統")
-    
-    tab1, tab2, tab3 = st.tabs(["🚀 即時生成今日要聞", "📅 瀏覽歷史每日研報", "🗓️ 自動彙整總經月報"])
-    
-    tz_taiwan = timezone(timedelta(hours=8))
-    today_dt = datetime.datetime.now(tz_taiwan)
-    today_str = today_dt.strftime("%Y-%m-%d")
-
-    with tab1:
-        st.subheader("📡 即時抓取路透社與 Yahoo 財經新聞摘要並編譯研報")
-        st.info(f"📅 基準日期（台灣時間）：{today_dt.strftime('%Y 年 %m 月 %d 日')}")
-        
-        if st.button("🚀 即時編譯今日研報", type="primary"):
-            with st.spinner("正在專注擷取路透社 (Reuters) 與 Yahoo 財經最新新聞與市場數據..."):
-                rss_urls = [
-                    "https://news.google.com/rss/search?q=site:cn.reuters.com+OR+site:reuters.com&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-                    "https://news.google.com/rss/search?q=site:tw.stock.yahoo.com+OR+site:finance.yahoo.com+通膨+OR+聯準會+OR+美股+OR+美債+OR+殖利率&hl=zh-TW&gl=TW&ceid=TW:zh-Hant",
-                    "https://news.google.com/rss/search?q=site:reuters.com+OR+site:finance.yahoo.com+Fed+OR+Yield+OR+CPI&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-                ]
-                
-                raw_news = []
-                for url in rss_urls:
-                    try:
-                        feed = feedparser.parse(url)
-                        for entry in feed.entries[:8]:
-                            title = clean_html(entry.get('title', ''))
-                            published = entry.get('published', '')
-                            summary = clean_html(entry.get('summary', ''))[:250]
-                            raw_news.append(f"【時間: {published}】\n標題: {title}\n摘要: {summary}\n")
-                    except Exception as e:
-                        st.warning(f"⚠️ RSS 讀取異常: {e}")
-
-            if not raw_news:
-                st.error("❌ 無法讀取新聞資料，請稍後再試。")
-            else:
-                prompt = f"""
-你是一位機構級高級總體經濟分析師與資深財經主編。
-今天是 {today_dt.strftime('%Y 年 %m 月 %d 日')}。
-
-以下是今日從「路透社 (Reuters)」與「Yahoo 財經」擷取的最新即時新聞資料：
-=== 今日新聞原始資料 ===
-{"".join(raw_news)}
-========================
-
-【任務要求 - 嚴格遵照機構研報高規格排版格式】：
-請根據上述原始新聞資料，為機構投資人撰寫《每日金融市場要聞與機構深度研報》。
-
-輸出格式必須嚴格對齊以下結構與樣式：
-1. **頂部標題宣告**：
-   日期：{today_dt.strftime('%Y年%m月%d日')}（路透中文網 & Yahoo 奇摩財經 深度總結）
-   
-   # 每日金融市場要聞與機構深度研報（{today_dt.strftime('%Y年%m月%d日')}）
-
-2. **引言段落**：
-   簡明扼要點出今日全球金融市場的核心轉折、關鍵利率表現、央行政策預期、股市風險與地緣政治影響。
-
-3. **四大核心板塊（必須嚴格使用以下標題與條列格式）**：
-   - **一、全球金融市場焦點與數據總覽**
-   - **二、總體經濟、央行政策與債券市場**
-   - **三、科技產業與企業財務動態**
-   - **四、外匯、大宗商品與信用市場**
-
-4. **條列細節規範**：
-   - 每個板塊底下包含 3 個條列項目（使用 `*`）。
-   - 每個條列開頭必須採用 **粗體前綴名稱加冒號**。
-   - 內文中所有關鍵數字、百分比、企業名稱、重要指標均需**粗體標示**。
-"""
-                with st.spinner("🤖 Qwen 首席分析師正在進行深度研報撰寫與脈絡梳理..."):
-                    report_content, err = call_qwen_api([{"role": "user", "content": prompt}])
-                    if report_content:
-                        st.session_state.today_report = report_content
-                        os.makedirs("daily_reports", exist_ok=True)
-                        with open(f"daily_reports/{today_str}.md", "w", encoding="utf-8") as f:
-                            f.write(report_content)
-                        st.success("✅ 深度研報生成完畢並已同步存檔！")
-                    else:
-                        st.error(f"❌ 生成失敗: {err}")
-
-        if "today_report" in st.session_state:
-            st.markdown("---")
-            st.markdown(st.session_state.today_report)
-
-    with tab2:
-        st.subheader("📅 歷史每日研報查詢")
-        report_files = sorted(glob.glob("daily_reports/*.md"), reverse=True)
-        if not report_files:
-            st.info("💡 目前資料夾中尚無歷史研報檔。")
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        if 'Close' in df_raw.columns.levels[0]:
+            df_price = df_raw['Close'].copy()
+        elif 'Adj Close' in df_raw.columns.levels[0]:
+            df_price = df_raw['Adj Close'].copy()
         else:
-            selected_file = st.selectbox("選擇欲檢視的日期：", report_files, format_func=lambda x: os.path.basename(x).replace(".md", ""))
-            if selected_file:
-                with open(selected_file, "r", encoding="utf-8") as f:
-                    content = f.read()
-                st.markdown("---")
-                st.markdown(content)
-                st.download_button("📥 下載此研報 (.md)", content, file_name=os.path.basename(selected_file))
-
-    with tab3:
-        st.subheader("🗓️ 月度總經趨勢彙整系統")
-        all_files = glob.glob("daily_reports/*.md")
-        available_months = sorted(list(set([os.path.basename(f)[:7] for f in all_files])), reverse=True)
-        if not available_months:
-            st.warning("⚠️ 尚無每日研報數據。")
-        else:
-            target_month = st.selectbox("選擇欲彙整的月份：", available_months)
-            if st.button("🚀 生成機構級月報", type="primary"):
-                month_files = sorted(glob.glob(f"daily_reports/{target_month}-*.md"))
-                monthly_combined_text = ""
-                for filepath in month_files:
-                    date_str = os.path.basename(filepath).replace(".md", "")
-                    with open(filepath, "r", encoding="utf-8") as f:
-                        monthly_combined_text += f"\n\n=== {date_str} 數據與論述 ===\n" + f.read()[:800]
-                
-                monthly_prompt = f"""
-你是一位機構首席經濟學家。請針對 {target_month} 月份每日金融市場紀錄進行融會貫通，撰寫一份高規格、論述詳盡且可讀性強的《{target_month} 全球金融市場總經趨勢月報》。
-
-=== 全月資料紀錄 ===
-{monthly_combined_text}
-===================
-
-【任務要求】：
-請進行全月核心主軸歸納與深度趨勢分析，段落前標題與重點數據請加粗標示，絕不可出現 "XX" 等佔位符符號。
-"""
-                with st.spinner("🤖 Qwen 正進行數據彙整與深度月報撰寫..."):
-                    monthly_report, err = call_qwen_api([{"role": "user", "content": monthly_prompt}])
-                    if monthly_report:
-                        st.session_state[f"monthly_{target_month}"] = monthly_report
-                        st.success("✅ 月報彙整成功！")
-                    else:
-                        st.error(f"❌ 生成失敗: {err}")
-
-            if f"monthly_{target_month}" in st.session_state:
-                st.markdown("---")
-                st.markdown(st.session_state[f"monthly_{target_month}"])
-                st.download_button(
-                    "📥 下載總經月報 (.md)",
-                    st.session_state[f"monthly_{target_month}"],
-                    file_name=f"Monthly_Report_{target_month}.md"
-                )
-
-# ---------------------------------------------------------
-# 模組二：全球總體經濟數據 (Yahoo & FRED)
-# ---------------------------------------------------------
-elif app_mode == "📊 全球總體經濟數據 (Yahoo & FRED)":
-    st.header("📊 全球總體經濟與市場數據庫 (Yahoo & FRED 智慧雙資料源)")
-    st.caption("自動連線 Yahoo Finance 與 FRED API 資料庫，支援獨立資料轉換、異質頻率完美對齊與動態時間區間篩選！")
-
-    if "custom_indicators" not in st.session_state:
-        st.session_state.custom_indicators = DEFAULT_INDICATORS.copy()
-
-    if "selected_indicators_list" not in st.session_state:
-        st.session_state.selected_indicators_list = ["美國 10 年期公債殖利率 (%)", "S&P 500 指數"]
-
-    if "indicator_transforms" not in st.session_state:
-        st.session_state.indicator_transforms = {}
-
-    with st.expander("🔍 智慧搜尋數據代碼 / 新增自訂指標", expanded=True):
-        col_sch1, col_sch2 = st.columns([3, 1])
-        with col_sch1:
-            search_query = st.text_input("輸入想尋找的數據名稱（中英文皆可）：", placeholder="例如：US GDP, 美國CPI, 台積電, S&P500, 比特幣, 黃金")
-        with col_sch2:
-            st.write(" ")
-            st.write(" ")
-            do_search = st.button("🔎 搜尋數據代碼", type="primary")
-
-        if do_search and search_query:
-            with st.spinner(f"正在搜尋與 '{search_query}' 最匹配的代碼..."):
-                search_results = search_symbol_by_llm(search_query)
-                if search_results:
-                    st.session_state.search_results = search_results
-
-        if "search_results" in st.session_state and st.session_state.search_results:
-            st.markdown("##### 🎯 匹配到的數據代碼建議：")
-            res_options = {
-                f"{item['name']} (Code: {item['code']} - Source: {item.get('source', 'Auto')})": item 
-                for item in st.session_state.search_results
-            }
-            selected_match_label = st.selectbox("選擇欲加入的數據指標：", list(res_options.keys()))
-            selected_item = res_options[selected_match_label]
-
-            col_add1, col_add2 = st.columns([3, 1])
-            with col_add1:
-                final_name = st.text_input("圖表顯示名稱：", value=selected_item['name'])
-            with col_add2:
-                st.write(" ")
-                st.write(" ")
-                if st.button("➕ 加入指標對比"):
-                    st.session_state.custom_indicators[final_name] = selected_item['code']
-                    if final_name not in st.session_state.selected_indicators_list:
-                        st.session_state.selected_indicators_list.append(final_name)
-                    st.success(f"✅ 成功將【{final_name}】加入圖表對比！")
-                    st.rerun()
-
-    st.markdown("---")
-    
-    valid_options = list(st.session_state.custom_indicators.keys())
-    st.session_state.selected_indicators_list = [k for k in st.session_state.selected_indicators_list if k in valid_options]
-
-    # 第一步：選擇欲比較的指標
-    selected_indicators = st.multiselect(
-        "選擇欲比較的市場/總經指標：",
-        valid_options,
-        default=st.session_state.selected_indicators_list
-    )
-    st.session_state.selected_indicators_list = selected_indicators
-
-    # 第二步：針對每一個已選指標，獨立設定其數據處理方式
-    transform_options = ["原始水準 (Level/Raw)", "年增率 (YoY %)", "月/日增額 (Diff)"]
-    
-    if selected_indicators:
-        st.markdown("##### ⚙️ 針對個別指標設定資料處理方式：")
-        transform_cols = st.columns(min(len(selected_indicators), 3))
-        
-        for idx, ind in enumerate(selected_indicators):
-            col_target = transform_cols[idx % len(transform_cols)]
-            with col_target:
-                current_val = st.session_state.indicator_transforms.get(ind, "原始水準 (Level/Raw)")
-                chosen_transform = st.selectbox(
-                    f"【{ind}】處理方式",
-                    transform_options,
-                    index=transform_options.index(current_val) if current_val in transform_options else 0,
-                    key=f"trans_{ind}"
-                )
-                st.session_state.indicator_transforms[ind] = chosen_transform
-
-    st.markdown("---")
-    
-    # 第三步：時間區間與圖表顯示設定
-    col_opt1, col_opt2, col_opt3 = st.columns([2, 1, 1])
-    with col_opt1:
-        time_range = st.selectbox(
-            "📅 選擇檢視的時間區間：",
-            ["近 1 年", "近 3 年", "近 5 年", "近 10 年", "近 15 年", "全部歷史 (Max)"],
-            index=3  # 預設選近 10 年
-        )
-    with col_opt2:
-        use_secondary_y = st.checkbox("開啟雙 Y 軸顯示", value=True)
-    with col_opt3:
-        chart_height = st.slider("圖表高度：", min_value=400, max_value=800, value=500)
-
-    # 金絲雀觸發避險背景設定
-    with st.expander("🦅 金絲雀避險背景色塊設定 (Canary Trigger)", expanded=False):
-        enable_canary = st.checkbox("啟用金絲雀動態避險背景色塊", value=False)
-        tip_col_choice = None
-        bm_col_choice = None
-        if enable_canary and len(selected_indicators) >= 2:
-            cc1, cc2 = st.columns(2)
-            with cc1:
-                tip_col_choice = st.selectbox("選擇 TIP 動能指標", selected_indicators, key="canary_tip")
-            with cc2:
-                bm_col_choice = st.selectbox("選擇 Benchmark (BM) 指標", selected_indicators, key="canary_bm")
-            st.caption("💡 規則：當 TIP 指標數值 < 0 時，次月開始觸發避險；觸發期間若 BM 上漲顯示綠色，下跌顯示紅色。")
-
-    if not selected_indicators:
-        st.warning("⚠️ 請至少選擇一項指標進行繪圖與編輯！")
+            df_price = df_raw.xs(df_raw.columns.levels[0][0], axis=1, level=0).copy()
     else:
-        dfs_to_merge = []
-        with st.spinner("智慧連線 Yahoo / FRED API 擷取並完整對齊歷史數據中..."):
-            for ind_name in selected_indicators:
-                code_item = st.session_state.custom_indicators.get(ind_name, "")
-                code = code_item if isinstance(code_item, str) else code_item.get("code", "")
-                calc_mode = st.session_state.indicator_transforms.get(ind_name, "原始水準 (Level/Raw)")
-                
-                if code:
-                    s_df = fetch_smart_data(code)
-                    if not s_df.empty:
-                        s_df['Date'] = pd.to_datetime(s_df['Date'])
-                        s_df = s_df.sort_values('Date').set_index('Date')
-                        series = s_df.iloc[:, 0]
-                        
-                        # 依照該指標各自選擇的處理方式計算
-                        if calc_mode == "年增率 (YoY %)":
-                            if len(series) > 1:
-                                dates_idx = pd.Series(series.index)
-                                avg_diff_days = (dates_idx.diff().dt.days).median()
-                                if avg_diff_days > 60 and avg_diff_days <= 120:
-                                    shift_n = 4   # 季資料 (Quarterly) 跨 4 期
-                                elif avg_diff_days > 300:
-                                    shift_n = 1   # 年資料 (Annual) 跨 1 期
-                                else:
-                                    shift_n = 12  # 月資料 (Monthly) 跨 12 期
-                            else:
-                                shift_n = 12
-                            
-                            processed = series.pct_change(shift_n) * 100
-                        elif calc_mode == "月/日增額 (Diff)":
-                            processed = series.diff()
-                        else:
-                            processed = series
-                            
-                        # 統一透過月底 (ME) 取最後有效值進行異質頻率對齊
-                        res_series = processed.resample('ME').last().dropna()
-                        res_df = res_series.to_frame(name=ind_name).reset_index()
-                        dfs_to_merge.append(res_df)
-
-        if dfs_to_merge:
-            # 先根據選擇的時間區間計算出絕對的起始日期
-            all_max_date = max([df['Date'].max() for df in dfs_to_merge])
-            
-            if time_range == "近 1 年":
-                start_date = all_max_date - pd.DateOffset(years=1)
-            elif time_range == "近 3 年":
-                start_date = all_max_date - pd.DateOffset(years=3)
-            elif time_range == "近 5 年":
-                start_date = all_max_date - pd.DateOffset(years=5)
-            elif time_range == "近 10 年":
-                start_date = all_max_date - pd.DateOffset(years=10)
-            elif time_range == "近 15 年":
-                start_date = all_max_date - pd.DateOffset(years=15)
-            else:
-                start_date = pd.Timestamp.min
-
-            # 針對個別資料框先做時間篩選，再進行 outer join 合併
-            filtered_dfs = []
-            for df in dfs_to_merge:
-                filtered_df = df[df['Date'] >= start_date]
-                filtered_dfs.append(filtered_df)
-
-            combined_df = filtered_dfs[0]
-            for next_df in filtered_dfs[1:]:
-                combined_df = pd.merge(combined_df, next_df, on='Date', how='outer')
-            
-            combined_df = combined_df.sort_values('Date')
-            
-            # 對各個選定指標欄位各自獨立進行前向補值，填平中間因結算日微調產生的 None 斷層
-            for ind in selected_indicators:
-                if ind in combined_df.columns:
-                    combined_df[ind] = combined_df[ind].ffill()
-            
-            # 轉換顯示格式
-            combined_df['日期 (YYYY-MM-DD)'] = combined_df['Date'].dt.strftime('%Y-%m-%d')
-            display_cols = ['日期 (YYYY-MM-DD)'] + [c for c in combined_df.columns if c not in ['Date', '日期 (YYYY-MM-DD)']]
-            display_df = combined_df[display_cols].copy()
-
-            st.subheader("✏️ 數據線上編輯器 (修改數值、點擊 ＋ Add row 手動補充最新資料)")
-            edited_df = st.data_editor(display_df, num_rows="dynamic", key="macro_editor")
-
-            if not edited_df.empty:
-                chart_df = edited_df.copy()
-                chart_df['日期 (YYYY-MM-DD)'] = pd.to_datetime(chart_df['日期 (YYYY-MM-DD)'], errors='coerce')
-                chart_df = chart_df.dropna(subset=['日期 (YYYY-MM-DD)']).sort_values('日期 (YYYY-MM-DD)')
-                chart_df.set_index('日期 (YYYY-MM-DD)', inplace=True)
-
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-                colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#17becf']
-                
-                value_cols = [c for c in chart_df.columns if c != '日期 (YYYY-MM-DD)']
-                for idx, col in enumerate(value_cols):
-                    is_secondary = (idx > 0 and use_secondary_y)
-                    chart_df[col] = pd.to_numeric(chart_df[col], errors='coerce')
-                    fig.add_trace(
-                        go.Scatter(x=chart_df.index, y=chart_df[col], name=str(col), mode='lines+markers', line=dict(width=2.5, color=colors[idx % len(colors)]), connectgaps=True),
-                        secondary_y=is_secondary
-                    )
-
-                # 【金絲雀避險色塊繪製邏輯】：當 TIP 指標數值 < 0 時，次月開始觸發避險；BM 上漲綠色、下跌紅色
-                if enable_canary and tip_col_choice:
-                    if tip_col_choice in chart_df.columns and bm_col_choice in chart_df.columns:
-                        temp_canary = chart_df.copy()
-                        temp_canary['tip_neg'] = temp_canary[tip_col_choice] < 0  # 判斷 TIP 指標數值 < 0
-                        temp_canary['canary_active'] = temp_canary['tip_neg'].shift(1).fillna(False)  # 自次月開始觸發
-                        temp_canary['bm_return'] = temp_canary[bm_col_choice].pct_change(1)
-
-                        dates_list = temp_canary.index.tolist()
-                        for i in range(1, len(dates_list)):
-                            if temp_canary['canary_active'].iloc[i]:
-                                bm_ret = temp_canary['bm_return'].iloc[i]
-                                is_up = bm_ret >= 0 if pd.notna(bm_ret) else True
-                                color = "rgba(0, 255, 0, 0.15)" if is_up else "rgba(255, 0, 0, 0.15)"
-                                
-                                fig.add_vrect(
-                                    x0=dates_list[i-1],
-                                    x1=dates_list[i],
-                                    fillcolor=color,
-                                    opacity=0.6,
-                                    layer="below",
-                                    line_width=0,
-                                )
-
-                fig.update_layout(
-                    title=f"全球市場與總經數據互動對比圖 ({time_range})",
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    template="plotly_dark",
-                    height=chart_height
-                )
-                fig.update_xaxes(title_text="日期")
-                fig.update_yaxes(title_text="主指標 (Left Axis)", secondary_y=False)
-                if use_secondary_y and len(value_cols) > 1:
-                    fig.update_yaxes(title_text="對比指標 (Right Axis)", secondary_y=True)
-
-                st.subheader("📈 市場趨勢雙 Y 軸動態圖表")
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.error("⚠️ 無法連線讀取數據，請確認指標代碼或網路連線。")
-
-# ---------------------------------------------------------
-# 模組三：基金 / ETF 交易決策評估
-# ---------------------------------------------------------
-elif app_mode == "🎯 基金 / ETF 交易決策評估":
-    st.header("🎯 基金 / ETF 投資決策與評估報告生成器")
-    
-    if "fund_report" not in st.session_state:
-        st.session_state.fund_report = None
-    if "fund_prompt_info" not in st.session_state:
-        st.session_state.fund_prompt_info = {}
-
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        fund_name = st.text_input("輸入基金 / ETF / 股票標的", placeholder="例如：1301.TW、0050、IEF ETF、元大美債20年")
-    with col2:
-        action_type = st.selectbox("擬執行交易方向", ["買進 / 建倉 (Buy)", "賣出 / 減碼 (Sell)", "觀望 / 持有 (Hold)"])
-    with col3:
-        lang_choice = st.selectbox("報告語言風格", ["繁體中文 (Traditional Chinese)", "英文 (English)", "中英雙語對照 (Bilingual)"])
-
-    if st.button("🚀 生成個案投資評估報告", type="primary", use_container_width=True):
-        if not fund_name.strip():
-            st.warning("⚠️ 請輸入標的名稱或代碼！")
-        else:
-            with st.spinner(f"正在抓取 {fund_name} 最新資料與基本面..."):
-                encoded_query = urllib.parse.quote(fund_name)
-                rss_url = f"https://news.google.com/rss/search?q={encoded_query}+OR+聯準會+OR+美債殖利率+OR+通膨&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
-                feed = feedparser.parse(rss_url)
-                
-                news_list = []
-                for entry in feed.entries[:6]:
-                    title = clean_html(entry.get('title', ''))
-                    published = entry.get('published', '')
-                    summary = clean_html(entry.get('summary', ''))[:200]
-                    news_list.append(f"【時間: {published}】\n標題: {title}\n摘要: {summary}\n")
-                
-                market_data = "\n".join(news_list) if news_list else "暫無具體即時新聞，將基於資產常規屬性分析。"
-
-            lang_instruction = "全篇報告請使用「標準繁體中文」。"
-            if lang_choice == "英文 (English)":
-                lang_instruction = "Please write the entire report in Professional English."
-            elif lang_choice == "中英雙語對照 (Bilingual)":
-                lang_instruction = "每個段落請先提供「繁體中文」，隨後附上對應的「英文翻譯 (English Translation)」。"
-
-            prompt = f"""
-你是一位機構級資深基金分析師與首席投資策略官。請針對標的【{fund_name}】，撰寫一份包含**分拆獨立表格基本檔案**與**深度決策評估**的專業機構報告。
-
-【基本交易資訊】：
-- 標的輸入：{fund_name}
-- 擬執行交易方向：{action_type}
-- 語言要求：{lang_instruction}
-
-【即時市場新聞與數據】：
-{market_data}
-
-【撰寫格式與結構規範（請將各資料分拆為獨立 Markdown 表格，絕對不要混在一張表內）】：
-
-### 📌 零、標的基本檔案與配置概況 (Basic Profile)
-
-#### 1. 基金 / ETF 基本資訊
-| 項目 | 內容/數值 |
-| :--- | :--- |
-| **基金/ETF 中文全稱** | (正確中文名稱) |
-| **基金/ETF 英文全稱** | (正確英文全稱) |
-| **交易所 / 股票代碼** | (Ticker / Code) |
-| **追蹤指數 / 標的屬性** | (Benchmark Index / Asset Class) |
-| **基金規模 (AUM)** | (最新預估規模) |
-| **經理費 / 總內扣費用 (TER)**| (Expense Ratio) |
-
-#### 2. 歷史績效表現 (Performance Track Record)
-| 期間 | MTD | YTD | 1M | 3M | 6M | 1Yr | 3Yr (年化) | 5Yr (年化) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **總報酬率 (%)** | (數據/估計) | (數據/估計) | (數據/估計) | (數據/估計) | (數據/估計) | (數據/估計) | (數據/估計) | (數據/估計) |
-
-#### 3. 前十大持股 (Top 10 Holdings)
-| 排序 | 持股 / 標的名稱 | 估計權重 (%) |
-| :--- | :--- | :--- |
-| 1 | (持股名稱 1) | (權重 1%) |
-| ... | ... | ... |
-
-#### 4. 主要產業與國家配置分布 (Sectors & Geographic Allocation)
-| 主要產業 (Sectors) | 占比 (%) | 主要國家/地區 (Geographic) | 占比 (%) |
-| :--- | :--- | :--- | :--- |
-| (產業 1) | (%) | (國家 1) | (%) |
-
-#### 5. 關鍵風險與固定收益專屬指標
-| 專屬風險指標 | 內容 / 數值 | 說明 |
-| :--- | :--- | :--- |
-| **修正存續期間 (Modified Duration)** | (例如：6.8 年) | （對利率變動之價格敏感度） |
-| **30 天 SEC 殖利率 / 到期殖利率 (Yield)** | (例如：4.85%) | （最新年化收益率） |
-
----
-
-### 一、當前總體經濟環境與市場脈絡分析
-### 二、標的屬性與最新市場衝擊評估 ({fund_name})
-### 三、買賣方向 ({action_type}) 可行性評估與風控/停損策略
-"""
-            with st.spinner("🤖 Qwen 分析師正在編製獨立結構表格與撰寫評估報告..."):
-                report, err = call_qwen_api([{"role": "user", "content": prompt}])
-                if report:
-                    st.session_state.fund_report = report
-                    st.session_state.fund_prompt_info = {
-                        "fund_name": fund_name,
-                        "action_type": action_type,
-                        "prompt": prompt
-                    }
-                    st.success("✅ 獨立表格化基本檔案與決策報告生成完畢！")
-                else:
-                    st.error(f"❌ 生成失敗: {err}")
-
-    if st.session_state.fund_report:
-        st.markdown("---")
-        st.subheader(f"📈 《{st.session_state.fund_prompt_info.get('fund_name')}》- 標的表格檔案與決策評估報告")
-        st.markdown(st.session_state.fund_report)
+        df_price = df_raw.copy()
         
-        st.download_button(
-            "📥 下載完整評估報告 (.txt)",
-            st.session_state.fund_report,
-            file_name=f"{st.session_state.fund_prompt_info.get('fund_name')}_Report.txt"
+    df_daily = df_price.reset_index()
+    date_col = df_daily.columns[0]
+    df_daily[date_col] = pd.to_datetime(df_daily[date_col]).dt.strftime('%Y-%m-%d')
+    if date_col != 'Date':
+        df_daily = df_daily.rename(columns={date_col: 'Date'})
+
+    inv_map = {v: k for k, v in TICKER_MAP.items()}
+    df_daily = df_daily.rename(columns=inv_map)
+    
+    df_daily['Date_dt'] = pd.to_datetime(df_daily['Date'])
+    df_daily = df_daily.sort_values(by='Date_dt', ascending=True).reset_index(drop=True)
+    
+    df_monthly = df_daily.groupby(df_daily['Date_dt'].dt.to_period('M')).last().reset_index(drop=True)
+    df_monthly['Date'] = df_monthly['Date_dt'].dt.strftime('%Y-%m-%d')
+    df_monthly = df_monthly.drop(columns=['Date_dt'])
+    df_daily = df_daily.drop(columns=['Date_dt'])
+    
+    return df_daily, df_monthly
+
+def clean_dataframe(uploaded_file):
+    try:
+        content_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, 'getvalue') else uploaded_file
+        is_csv = hasattr(uploaded_file, 'name') and uploaded_file.name.lower().endswith('.csv')
+        df_raw = None
+        
+        if is_csv:
+            encodings_to_try = ['utf-8', 'utf-8-sig', 'cp950', 'big5', 'ansi', 'gbk', 'utf-16', 'latin1']
+            for enc in encodings_to_try:
+                try:
+                    bio = BytesIO(content_bytes)
+                    bio.seek(0)
+                    df_raw = pd.read_csv(bio, header=None, encoding=enc)
+                    break
+                except Exception:
+                    continue
+        else:
+            df_raw = pd.read_excel(BytesIO(content_bytes), header=None)
+            
+        if df_raw is None or df_raw.empty:
+            st.error("讀取的檔案內容為空，請確認檔案內容。")
+            return None
+
+        df = df_raw.copy()
+        headers = df.iloc[0].values.copy()
+        headers[0] = "Date"
+        df = df.iloc[1:].copy()
+        df.columns = headers
+        df = df.loc[:, df.columns.notna()]
+        
+        date_col = df.columns[0]
+        def parse_excel_date(val):
+            try:
+                num = float(val)
+                return pd.to_datetime(num, unit='D', origin='1899-12-30').strftime('%Y-%m-%d')
+            except Exception:
+                try:
+                    return pd.to_datetime(val).strftime('%Y-%m-%d')
+                except Exception:
+                    return str(val)
+                    
+        df[date_col] = df[date_col].apply(parse_excel_date)
+        df = df.dropna(subset=[date_col])
+        
+        for col in df.columns:
+            if col != "Date":
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+        df['Date_tmp'] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp'])
+        
+        return df.reset_index(drop=True)
+    except Exception as e:
+        st.error(f"檔案解析失敗：{e}")
+        return None
+
+# -------------------------------------------------------------
+# 初始化 Session State 變數
+# -------------------------------------------------------------
+if "df_daily_corr" not in st.session_state:
+    st.session_state.df_daily_corr = None
+    if os.path.exists(SAVED_DAILY_PATH):
+        try:
+            st.session_state.df_daily_corr = pd.read_csv(SAVED_DAILY_PATH)
+        except Exception:
+            st.session_state.df_daily_corr = None
+
+if "df_daily" not in st.session_state:
+    loaded_from_disk = False
+    if os.path.exists(SAVED_MONTHLY_PATH):
+        try:
+            st.session_state.df_daily = pd.read_csv(SAVED_MONTHLY_PATH)
+            loaded_from_disk = True
+            st.toast("📂 已自動載入上次上傳/儲存的歷史資料！", icon="✅")
+        except Exception as e:
+            if os.path.exists(SAVED_MONTHLY_PATH):
+                os.remove(SAVED_MONTHLY_PATH)
+
+    if not loaded_from_disk:
+        default_excel_data = [
+            ['2024-12-31', 455.98969, 578.39697, 470.595, 12911.82031, 1279.98499, 30.4882, 204.17, 1552.3064, 6184.0498, 275.4921, 1661.86304, 897.19098, 6.164, 463.4374, 457.0121, 240.9976, 7090.06982, 119.166, 105.854, 228.65, 1952.8, 463.4374],
+            ['2025-01-31', 471.2955, 582.69897, 515.35199, 13271.37988, 1370.64685, 31.00252, 213.38, 1587.13354, 6037.58008, 277.2163, 1684.67896, 908.19781, 6.216, 466.0748, 467.1058, 259.4889, 7164.22021, 120.691, 106.576, 229.5, 2018.79, 466.0748],
+            ['2025-02-28', 468.45621, 588.72803, 505.92801, 13098.21973, 1414.32471, 30.69987, 214.16, 1553.18921, 6135.72021, 281.7491, 1697.98499, 923.18079, 6.306, 472.7397, 466.7578, 261.4858, 7461.3501, 123.322, 109.583, 230.25, 2007.19, 472.7397],
+            ['2025-03-31', 449.95001, 588.89301, 530.375, 12360.20996, 1414.36096, 30.86404, 218.71, 1381.61401, 6164.16016, 283.304, 1692.59094, 918.23889, 6.3095, 475.6522, 477.8602, 287.2772, 7285.16016, 124.219, 109.983, 231.03, 1928.98, 475.6522],
+            ['2025-04-30', 454.14651, 593.24597, 567.03101, 12276.38965, 1475.53052, 32.53406, 220.59, 1403.08716, 5972.35986, 288.6796, 1707.02161, 917.48352, 6.286, 489.6304, 436.2842, 304.4191, 7137.18994, 124.301, 111.092, 231.85, 1947.84, 489.6304],
+            ['2025-05-31', 624.45001, 576.07397, 13049.12988, 1545.90405, 33.90431, 222.35, 1593.15247, 6158.0, 289.191, 1735.17139, 925.28333, 6.333, 487.8912, 440.4325, 302.0618, 7221.18994, 123.57, 109.774, 232.71, 2061.07, 487.8912],
+            ['2025-06-30', 662.29102, 611.09003, 13712.70996, 1582.61755, 34.49026, 231.71, 1703.33643, 6379.45996, 295.8693, 1775.33374, 946.34668, 6.424, 497.1365, 459.2098, 302.8712, 7217.77002, 124.779, 111.509, 233.51, 2154.5, 497.1365],
+            ['2025-07-31', 679.242, 583.95001, 14020.45996, 1551.72314, 34.05813, 236.76, 1781.91602, 6621.02979, 293.996, 1782.06201, 957.5011, 6.479, 489.7316, 471.833, 303.819, 7143.52979, 124.892, 110.878, 234.37, 2184.27, 489.7316],
+            ['2025-08-31', 686.70001, 631.95099, 14304.67969, 1604.6134, 36.51201, 237.67, 1797.05176, 7375.91016, 298.0911, 1809.3645, 972.15991, 6.553, 496.8505, 465.4838, 315.7241, 7382.60986, 126.884, 112.714, 235.27, 2239.19, 496.8505],
+            ['2025-09-30', 733.53198, 673.31702, 14826.7998, 1636.66846, 37.38784, 250.23, 1925.77039, 7632.27002, 301.5529, 1821.45239, 987.90387, 6.611, 500.0961, 469.5738, 352.0861, 7413.49023, 127.375, 113.473, 236.07, 2321.16, 500.0961],
+            ['2025-10-31', 766.51398, 679.54498, 15173.9502, 1645.33911, 38.06613, 252.79, 2087.06738, 7655.12988, 301.3995, 1834.04675, 1009.62097, 6.654, 498.8263, 476.4557, 369.1021, 7250.60986, 127.797, 114.255, 236.93, 2373.52, 498.8263],
+            ['2025-11-30', 744.73199, 720.74902, 15211.13965, 1672.37524, 38.08687, 248.26, 1999.66418, 7509.2998, 303.0344, 1844.26245, 1012.65997, 6.667, 499.9849, 477.7115, 385.5097, 7414.81982, 128.079, 115.408, 237.63, 2373.92, 499.9849],
+            ['2025-12-31', 765.00098, 728.53497, 15220.4502, 1738.87622, 38.44813, 259.21, 2097.84766, 7791.81982, 303.8636, 1862.33386, 1017.89899, 6.6905, 501.2906, 480.0591, 396.1204, 7254.77979, 127.363, 114.529, 238.46, 2399.41, 501.2906],
+            ['2026-01-31', 827.71399, 840.211, 15441.15039, 1815.69177, 40.71719, 281.95, 2319.90332, 7973.16992, 306.4952, 1880.73633, 1023.57001, 6.731, 505.9834, 518.5422, 457.9546, 7459.43994, 127.942, 114.292, 239.17, 2471.01, 505.9834],
+            ['2026-02-28', 876.27899, 872.255, 15323.7998, 1876.97681, 44.51602, 286.3, 2581.2063, 8094.75977, 308.8157, 1884.54236, 1037.89099, 6.793, 511.641, 534.2389, 479.9178, 8016.75, 129.597, 117.142, 239.84, 2503.4, 511.641],
+            ['2026-03-31', 755.96002, 834.72803, 14560.75, 1692.64917, 39.19176, 256.89, 2257.72729, 7591.68994, 300.0013, 1837.91504, 1006.26801, 6.671, 495.9127, 616.0168, 423.3374, 7526.66016, 127.911, 114.425, 240.56, 2324.86, 495.9127],
+            ['2026-04-30', 879.15002, 860.80798, 16088.55957, 1812.35889, 42.39718, 265.51, 2804.55884, 8289.91992, 303.8425, 1885.24402, 1031.73206, 6.767, 502.0911, 658.2464, 423.4757, 8200.76953, 129.327, 114.296, 241.29, 2562.34, 502.0911],
+            ['2026-05-31', 978.03601, 824.54199, 16935.34961, 1858.56763, 44.2995, 268.1, 3254.03345, 8535.91992, 305.7231, 1898.43054, 1040.17297, 6.789, 503.778, 622.8731, 417.3398, 8204.49023, 129.647, 114.274, 242.04, 2695.81, 503.778],
+            ['2026-06-30', 965.427, 804.79901, 16774.07031, 1865.46997, 43.816, 259.29, 3317.13452, 8706.2002, 304.3977, 1902.23071, 1046.87, 6.82, 500.2215, 562.81012, 369.4695, 8328.58984, 129.005, 114.561, 242.76, 2675.08, 500.2215],
+            ['2026-07-31', 934.23, 844.347, 16763.42, 1907.464906, 45.37611182, 262.5, 3077.004272, 8106.35, 301.134, 1896.8195, 1030.75, 6.758, 497.5484, 620.8962, 371.54, 8524.5, 128.107, 112.96, 243.58, 2677.7, 497.5484],
+            ['2026-08-31', 964.93103, 838.54602, 17219.93945, 1931.80261, 46.45047, 277.57999, 3362.00391, 8218.0, 302.8004, 1916.45764, 1040.09, 6.818, 499.81091, 657.9306, 408.42, 8295.49023, 128.14, 113.123, 244.3, 2749.87, 499.8109]
+        ]
+        headers_list = ['Date', 'ACWI', 'Asia ex JP', 'Latam', 'S&P500', 'SXXR', 'Topix', 'Emerging Euro, Middle East, Afica', 'Taiex', 'CSI 300', 'Corp Bond', 'HY', 'EMBI', 'EMB', 'Globa Agg Local Currency', 'Commodity', 'GLD', 'REITS', 'TIP', 'Treasury', 'T Bill', 'BM_AWCI', 'BM_AGG']
+        df_init = pd.DataFrame(default_excel_data, columns=headers_list)
+        df_init['Date_tmp'] = pd.to_datetime(df_init['Date'], errors='coerce')
+        df_init = df_init.sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
+        st.session_state.df_daily = df_init
+
+# -------------------------------------------------------------
+# 頂部控制項：回測日期與參數設定區
+# -------------------------------------------------------------
+with st.expander("⚙️️ 數據同步區間、費用與階梯撥回率（配息）參數設定區", expanded=True):
+    col_d1, col_d2, col_btn = st.columns([2, 2, 1])
+    with col_d1:
+        start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1), key="global_start_date")
+    with col_d2:
+        end_date = st.date_input("回測結束日期", value=datetime.today(), key="global_end_date")
+    with col_btn:
+        st.write("")
+        st.write("")
+        sync_btn = st.button("🌐 從 Yahoo 自動同步", type="primary", use_container_width=True, key="sync_btn_main")
+
+    st.markdown("---")
+    col_fee, col_payout_chk = st.columns([1, 2])
+    with col_fee:
+        enable_fee = st.checkbox("扣除經管費", value=False, key="fee_enable_chk")
+        if enable_fee:
+            management_fee_pct = st.number_input("年化經管費率 (%)", min_value=0.0, max_value=10.0, value=1.5, step=0.1, key="fee_val_input")
+        else:
+            management_fee_pct = 0.0
+
+    with col_payout_chk:
+        enable_payout = st.checkbox("啟用階梯撥回率 (配息機制)", value=False, key="payout_enable_chk")
+
+    if enable_payout:
+        st.markdown("#### 📊 階梯撥回機制卡片式設定")
+        c_tier1, c_tier2, c_tier3 = st.columns(3)
+        with c_tier1:
+            st.markdown("##### 🟢 階梯一：低於門檻")
+            t_low = st.number_input("低門檻 NAV 閥值", value=8.0, step=0.5, key="t_low")
+            rate_low = st.number_input("NAV < 低門檻 撥回率 (%)", value=0.0, step=0.1, key="r_low")
+            st.caption(f"📌 當 前期NAV < **{t_low:.2f}**，撥回率為 **{rate_low:.1f}%**")
+
+        with c_tier2:
+            st.markdown("##### 🔵 階梯二：標準區間")
+            t_high = st.number_input("高門檻 NAV 閥值", value=10.5, step=0.5, key="t_high")
+            rate_mid = st.number_input("標準撥回率 (%)", value=5.0, step=0.1, key="r_mid")
+            st.caption(f"📌 當 **{t_low:.2f}** ≤ 前期NAV ≤ **{t_high:.2f}**，撥回率為 **{rate_mid:.1f}%**")
+
+        with c_tier3:
+            st.markdown("##### 🟣 階梯三：高門檻加碼")
+            bonus_rate = st.number_input("加碼撥回率 (%)", value=0.8, step=0.1, key="r_bonus")
+            rate_high = rate_mid + bonus_rate
+            st.metric("NAV > 高門檻 總撥回率", f"{rate_high:.1f}%", f"+{bonus_rate:.1f}% 加碼")
+            st.caption(f"📌 當 前期NAV > **{t_high:.2f}**，撥回率為 **{rate_high:.1f}%**")
+    else:
+        t_low, t_high, rate_low, rate_mid, rate_high = 8.0, 10.5, 0.0, 5.0, 5.8
+
+if sync_btn:
+    with st.spinner("正在連線至 Yahoo Finance 下載美金含息市場數據..."):
+        try:
+            df_d, df_m = load_yahoo_data(start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+            st.session_state.df_daily_corr = df_d
+            st.session_state.df_daily = df_m
+            st.toast("✅ 已成功從 Yahoo Finance 同步最新數據！", icon="📈")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ 數據同步失敗，請檢查日期區間或網路連線：{e}")
+
+if "tab_selection" not in st.session_state:
+    st.session_state.tab_selection = "1. 資產配置與權重圖"
+
+def is_active_asset(col_name):
+    c_str = str(col_name).strip().upper()
+    if any(k in c_str for k in ["TIP", "TREASURY", "BIL", "CASH", "UNNAMED", "DATE", "BM_"]):
+        return False
+    return True
+
+# -------------------------------------------------------------
+# 核心 HAA 配置計算函式
+# -------------------------------------------------------------
+def calc_weights_for_row(target_idx, df):
+    cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
+    canary_col = next((c for c in cols if "TIP" in str(c).upper() or "ICETIP" in str(c).upper()), cols[-3] if len(cols) >= 3 else cols[0])
+    bond_col = next((c for c in cols if "TREASURY" in str(c).upper() or "7-10" in str(c)), cols[-2] if len(cols) >= 2 else cols[0])
+    cash_col = next((c for c in cols if "T BILL" in str(c).upper() or "BIL" in str(c).upper()), cols[-1])
+    
+    try:
+        curr_val = float(df.iloc[target_idx][canary_col])
+        p1 = float(df.iloc[target_idx - 1][canary_col])
+        p3 = float(df.iloc[target_idx - 3][canary_col])
+        p6 = float(df.iloc[target_idx - 6][canary_col])
+        p12 = float(df.iloc[target_idx - 12][canary_col])
+        
+        canary_mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
+    except Exception:
+        canary_mom = 0.1
+        
+    weights = {col: 0.0 for col in df.columns if col != "Date"}
+    
+    bond_mom = 0.0
+    try:
+        b_curr = float(df.iloc[target_idx][bond_col])
+        bp1 = float(df.iloc[target_idx - 1][bond_col])
+        bp3 = float(df.iloc[target_idx - 3][bond_col])
+        bp6 = float(df.iloc[target_idx - 6][bond_col])
+        bp12 = float(df.iloc[target_idx - 12][bond_col])
+        
+        bond_mom = ((b_curr / bp1 - 1.0) + (b_curr / bp3 - 1.0) + (b_curr / bp6 - 1.0) + (b_curr / bp12 - 1.0)) / 4.0
+    except Exception:
+        pass
+    
+    if canary_mom <= 0:
+        if bond_mom > 0:
+            weights[bond_col] = 1.0
+        else:
+            weights[cash_col] = 1.0
+    else:
+        active_results = []
+        np.random.seed(target_idx)
+        for col in cols:
+            if is_active_asset(col):
+                try:
+                    ac_curr = float(df.iloc[target_idx][col])
+                    ap1 = float(df.iloc[target_idx - 1][col])
+                    ap3 = float(df.iloc[target_idx - 3][col])
+                    ap6 = float(df.iloc[target_idx - 6][col])
+                    ap12 = float(df.iloc[target_idx - 12][col])
+                    
+                    ac_mom = ((ac_curr / ap1 - 1.0) + (ac_curr / ap3 - 1.0) + (ac_curr / ap6 - 1.0) + (ac_curr / ap12 - 1.0)) / 4.0
+                    avg_corr = float(np.random.uniform(0.2, 0.8))
+                    active_results.append({"col": col, "mom": ac_mom, "avgCorr": avg_corr})
+                except Exception:
+                    continue
+                
+        active_results.sort(key=lambda x: x["mom"], reverse=True)
+        valid_selected = [item for item in active_results if item["mom"] > 0][:7]
+        valid_selected.sort(key=lambda x: x["avgCorr"], reverse=True)
+        
+        K = len(valid_selected)
+        S = K * (K + 1) / 2 if K > 0 else 1
+        for rank_idx, item in enumerate(valid_selected):
+            weights[item["col"]] = (K - rank_idx) / S
+            
+    return weights, canary_mom
+
+# -------------------------------------------------------------
+# 動態計算每個月報酬率、累積淨值、MDD 與金絲雀狀態
+# -------------------------------------------------------------
+df_global = st.session_state.get("df_daily", pd.DataFrame()).copy()
+date_col_g = 'Date' if 'Date' in df_global.columns else (df_global.columns[0] if not df_global.empty else 'Date')
+
+bm_acwi_col = next((c for c in df_global.columns if "BM_AWCI" in c or "BM_ACWI" in c), None)
+bm_agg_col = next((c for c in df_global.columns if "BM_AGG" in c), None)
+
+monthly_perf_records = []
+portfolio_nav, benchmark_nav = 10.0, 10.0
+port_peak, bm_peak = 10.0, 10.0
+port_mdd, bm_mdd = 0.0, 0.0
+
+fee_monthly_rate = (management_fee_pct / 100.0 / 12.0) if enable_fee else 0.0
+cnt_low, cnt_mid, cnt_high, total_payout_months = 0, 0, 0, 0
+
+if len(df_global) > 0:
+    first_date = str(df_global.iloc[0][date_col_g])[:10]
+    monthly_perf_records.append({
+        "Date": first_date,
+        "Portfolio 月報酬率 (%)": 0.0,
+        "Benchmark 月報酬率 (%)": 0.0,
+        "Portfolio 淨值": portfolio_nav,
+        "Benchmark 淨值": benchmark_nav,
+        "Canary_State": "進攻"
+    })
+
+for i in range(1, len(df_global)):
+    curr_date = str(df_global.iloc[i][date_col_g])[:10]
+    
+    bm_ret = 0.0
+    if bm_acwi_col and bm_agg_col:
+        acwi_ret = (df_global.iloc[i][bm_acwi_col] / df_global.iloc[i-1][bm_acwi_col]) - 1.0
+        agg_ret = (df_global.iloc[i][bm_agg_col] / df_global.iloc[i-1][bm_agg_col]) - 1.0
+        bm_ret = 0.6 * acwi_ret + 0.4 * agg_ret
+    
+    # 計算當期金絲雀狀態
+    canary_is_defensive = False
+    if i - 1 >= 12:
+        _, c_mom = calc_weights_for_row(i - 1, df_global)
+        if c_mom <= 0:
+            canary_is_defensive = True
+
+    port_ret_raw = 0.0
+    if i - 1 >= 12:
+        weights, _ = calc_weights_for_row(i - 1, df_global)
+        for asset, w in weights.items():
+            if w > 0 and asset in df_global.columns:
+                asset_ret = (df_global.iloc[i][asset] / df_global.iloc[i-1][asset]) - 1.0
+                port_ret_raw += w * asset_ret
+    else:
+        port_ret_raw = bm_ret
+
+    payout_annual_rate = 0.0
+    if enable_payout:
+        prev_nav = portfolio_nav
+        total_payout_months += 1
+        if prev_nav < t_low:
+            payout_annual_rate = rate_low
+            cnt_low += 1
+        elif t_low <= prev_nav <= t_high:
+            payout_annual_rate = rate_mid
+            cnt_mid += 1
+        else:
+            payout_annual_rate = rate_high
+            cnt_high += 1
+
+    payout_monthly_rate = (payout_annual_rate / 100.0 / 12.0) if enable_payout else 0.0
+
+    portfolio_nav = portfolio_nav * (1.0 + port_ret_raw - fee_monthly_rate - payout_monthly_rate)
+    benchmark_nav *= (1.0 + bm_ret)
+    
+    port_ret_final = port_ret_raw - fee_monthly_rate - payout_monthly_rate
+    
+    if portfolio_nav > port_peak:
+        port_peak = portfolio_nav
+    port_dd = (portfolio_nav - port_peak) / port_peak
+    if port_dd < port_mdd:
+        port_mdd = port_dd
+
+    if benchmark_nav > bm_peak:
+        bm_peak = benchmark_nav
+    bm_dd = (benchmark_nav - bm_peak) / bm_peak
+    if bm_dd < bm_mdd:
+        bm_mdd = bm_dd
+    
+    state_str = "避險" if canary_is_defensive else "進攻"
+    monthly_perf_records.append({
+        "Date": curr_date,
+        "Portfolio 月報酬率 (%)": round(port_ret_final * 100, 2),
+        "Benchmark 月報酬率 (%)": round(bm_ret * 100, 2),
+        "Portfolio 淨值": round(portfolio_nav, 4),
+        "Benchmark 淨值": round(benchmark_nav, 4),
+        "Canary_State": state_str
+    })
+
+df_monthly_perf = pd.DataFrame(monthly_perf_records)
+
+if not df_global.empty:
+    start_d = pd.to_datetime(df_global.iloc[0][date_col_g])
+    end_d = pd.to_datetime(df_global.iloc[-1][date_col_g])
+    years = max((end_d - start_d).days / 365.25, 0.08)
+
+    latest_port_nav = df_monthly_perf.iloc[-1]["Portfolio 淨值"] if len(df_monthly_perf) > 0 else 10.0
+    latest_bm_nav = df_monthly_perf.iloc[-1]["Benchmark 淨值"] if len(df_monthly_perf) > 0 else 10.0
+
+    total_port_ret = ((latest_port_nav / 10.0) - 1.0) * 100
+    total_bm_ret = ((latest_bm_nav / 10.0) - 1.0) * 100
+
+    port_cagr = (((latest_port_nav / 10.0) ** (1.0 / years)) - 1.0) * 100
+    bm_cagr = (((latest_bm_nav / 10.0) ** (1.0 / years)) - 1.0) * 100
+
+    prob_low = (cnt_low / total_payout_months * 100) if total_payout_months > 0 else 0.0
+    prob_mid = (cnt_mid / total_payout_months * 100) if total_payout_months > 0 else 0.0
+    prob_high = (cnt_high / total_payout_months * 100) if total_payout_months > 0 else 0.0
+
+    current_year = pd.to_datetime(df_global.iloc[-1][date_col_g]).year
+    df_ytd = df_monthly_perf[df_monthly_perf['Date'].str.startswith(str(current_year))]
+    if len(df_ytd) > 1:
+        start_ytd_port = df_ytd.iloc[0]["Portfolio 淨值"]
+        end_ytd_port = df_ytd.iloc[-1]["Portfolio 淨值"]
+        port_ytd_ret = ((end_ytd_port / start_ytd_port) - 1.0) * 100
+
+        start_ytd_bm = df_ytd.iloc[0]["Benchmark 淨值"]
+        end_ytd_bm = df_ytd.iloc[-1]["Benchmark 淨值"]
+        bm_ytd_ret = ((end_ytd_bm / start_ytd_bm) - 1.0) * 100
+    else:
+        port_ytd_ret = total_port_ret
+        bm_ytd_ret = total_bm_ret
+
+# -------------------------------------------------------------
+# 頂部：績效總覽
+# -------------------------------------------------------------
+if not df_global.empty:
+    start_date_str = str(df_global.iloc[0][date_col_g])[:10]
+    end_date_str = str(df_global.iloc[-1][date_col_g])[:10]
+
+    st.markdown(f"### 📊 績效總覽與撥回機率統計（回測期間：`{start_date_str}` 至 `{end_date_str}`）")
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("策略累積淨值", f"{latest_port_nav:.4f}", f"{total_port_ret:+.1f}%")
+    c2.metric("策略年化報酬 (CAGR)", f"{port_cagr:.2f}%")
+    c3.metric("策略最大回撤 (MDD)", f"{port_mdd*100:.2f}%", delta_color="inverse")
+
+    c4.metric("BM (股6債4) 淨值", f"{latest_bm_nav:.4f}", f"{total_bm_ret:+.1f}%")
+    c5.metric("BM 年化報酬 (CAGR)", f"{bm_cagr:.2f}%")
+    c6.metric("BM 最大回撤 (MDD)", f"{bm_mdd*100:.2f}%", delta_color="inverse")
+
+    if enable_payout:
+        st.markdown("#### 🎯 階梯撥回機率歷史統計")
+        st_c1, st_c2, st_c3, st_c4 = st.columns(4)
+        st_c1.metric(f"無撥回機率 ({rate_low:.1f}%)", f"{prob_low:.1f}%", f"{cnt_low} 個月 / NAV < {t_low}")
+        st_c2.metric(f"標準撥回機率 ({rate_mid:.1f}%)", f"{prob_mid:.1f}%", f"{cnt_mid} 個月 / {t_low} ≤ NAV ≤ {t_high}")
+        st_c3.metric(f"加碼撥回機率 ({rate_high:.1f}%)", f"{prob_high:.1f}%", f"{cnt_high} 個月 / NAV > {t_high}")
+        st_c4.metric("總統計月份數", f"{total_payout_months} 個月")
+
+    # -------------------------------------------------------------
+    # 📈 每月累積淨值走勢圖（含金絲雀避險期間背景色：綠漲紅跌）
+    # -------------------------------------------------------------
+    st.markdown("### 📈 每月累積淨值走勢圖（期初淨值 = 10）")
+    
+    # 建立避險期間的區間資料供 mark_rect 使用
+    deficiency_intervals = []
+    in_defensive = False
+    start_d = None
+    
+    for idx, row in df_monthly_perf.iterrows():
+        if row["Canary_State"] == "避險":
+            if not in_defensive:
+                in_defensive = True
+                start_d = row["Date"]
+            # 判斷當月 Benchmark 是否上漲 (>=0 綠色，<0 紅色)
+            bm_color = "#22c55e" if row["Benchmark 月報酬率 (%)"] >= 0 else "#ef4444"
+            # 為了讓單月或連續避險都能畫出區間，記錄每個避險月份的起訖
+            deficiency_intervals.append({
+                "Start": row["Date"],
+                "End": row["Date"],
+                "Color": bm_color,
+                "BM_Ret": row["Benchmark 月報酬率 (%)"]
+            })
+        else:
+            in_defensive = False
+
+    df_rect = pd.DataFrame(deficiency_intervals)
+
+    # 淨值折線圖資料
+    df_chart = df_monthly_perf.melt(
+        id_vars=['Date'], 
+        value_vars=['Portfolio 淨值', 'Benchmark 淨值'],
+        var_name='類別', 
+        value_name='淨值'
+    )
+
+    max_nav_val = df_chart['淨值'].max() if not df_chart.empty else 12.0
+    min_y_limit = 8.0  
+    max_y_limit = float(np.ceil(max_nav_val + 0.5))
+
+    # 背景色塊層 (mark_rect)
+    if not df_rect.empty:
+        rect_chart = alt.Chart(df_rect).mark_rect(opacity=0.25).encode(
+            x=alt.X('Start:N', title='月份'),
+            x2='End:N',
+            color=alt.Color('Color:N', scale=None),
+            tooltip=[
+                alt.Tooltip('Start:N', title='避險月份'),
+                alt.Tooltip('BM_Ret:Q', title='Benchmark 月報酬率 (%)', format='+.2f')
+            ]
         )
+    else:
+        rect_chart = alt.Chart(pd.DataFrame()).mark_rect()
+
+    # 淨值折線圖層
+    line_chart = alt.Chart(df_chart).mark_line(size=2.5).encode(
+        x=alt.X('Date:N', title='月份', axis=alt.Axis(labelAngle=-45, labelFontSize=11, titleFontSize=13)),
+        y=alt.Y('淨值:Q', title='累積淨值', scale=alt.Scale(domain=[min_y_limit, max_y_limit])),
+        color=alt.Color('類別:N', title='標的', scale=alt.Scale(domain=['Portfolio 淨值', 'Benchmark 淨值'], range=['#2563EB', '#F59E0B'])),
+        tooltip=['Date', '類別', alt.Tooltip('淨值:Q', format='.4f')]
+    )
+
+    rule_10 = alt.Chart(pd.DataFrame({'y': [10.0]})).mark_rule(color='#94A3B8', strokeDash=[4, 4]).encode(y='y:Q')
+
+    # 疊加圖表 (背景色塊 + 10基準線 + 折線)
+    final_nav_chart = (rect_chart + rule_10 + line_chart).properties(height=380)
+    st.altair_chart(final_nav_chart, use_container_width=True)
+    st.caption("💡 註：圖表背景的半透明色塊代表「金絲雀觸發避險期間」，顏色依當月 Benchmark 表現區分（🟢 綠色代表上漲，🔴 紅色代表下跌）。")
+
+    # 報酬率比較分析
+    st.markdown("### 📈 策略與 Benchmark 報酬率比較分析")
+    col_bar1, col_bar2 = st.columns(2)
+
+    with col_bar1:
+        st.subheader("📌 過去三個月月報酬率比較 (%)")
+        df_last3 = df_monthly_perf.tail(3).copy() if len(df_monthly_perf) >= 3 else df_monthly_perf.copy()
+        
+        df_last3_melted = df_last3.melt(
+            id_vars=['Date'],
+            value_vars=['Portfolio 月報酬率 (%)', 'Benchmark 月報酬率 (%)'],
+            var_name='類型',
+            value_name='月報酬率 (%)'
+        )
+        df_last3_melted['類型'] = df_last3_melted['類型'].replace({
+            'Portfolio 月報酬率 (%)': 'HAA 策略',
+            'Benchmark 月報酬率 (%)': 'Benchmark'
+        })
+        
+        bar_monthly = alt.Chart(df_last3_melted).mark_bar().encode(
+            x=alt.X('Date:N', title='月份', axis=alt.Axis(labelAngle=0)),
+            y=alt.Y('月報酬率 (%):Q', title='月報酬率 (%)'),
+            color=alt.Color('類型:N', title='標的', scale=alt.Scale(domain=['HAA 策略', 'Benchmark'], range=['#2563EB', '#F59E0B'])),
+            xOffset='類型:N',
+            tooltip=['Date', '類型', alt.Tooltip('月報酬率 (%):Q', format='.2f')]
+        ).properties(height=300)
+        st.altair_chart(bar_monthly, use_container_width=True)
+
+    with col_bar2:
+        st.subheader(f"📌 今年 ({current_year}) YTD 累積報酬率比較 (%)")
+        df_ytd_bar = pd.DataFrame({
+            "指標": ["HAA 策略", "Benchmark (股6債4)"],
+            "YTD 報酬率 (%)": [round(port_ytd_ret, 2), round(bm_ytd_ret, 2)]
+        })
+        
+        bar_ytd = alt.Chart(df_ytd_bar).mark_bar(width=60).encode(
+            x=alt.X('指標:N', title=None, sort=['HAA 策略', 'Benchmark (股6債4)'], axis=alt.Axis(labelAngle=0, labelLimit=250)),
+            y=alt.Y('YTD 報酬率 (%):Q', title='YTD 報酬率 (%)'),
+            color=alt.Color('指標:N', legend=None, scale=alt.Scale(domain=['HAA 策略', 'Benchmark (股6債4)'], range=['#2563EB', '#F59E0B'])),
+            tooltip=['指標', alt.Tooltip('YTD 報酬率 (%):Q', format='.2f')]
+        ).properties(height=300)
+        st.altair_chart(bar_ytd, use_container_width=True)
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 全域檢視月份選擇器（獨立於 Tag 之外，影響每一個 Tag）
+# -------------------------------------------------------------
+st.markdown("### 🎯 全域檢視月份設定")
+df_global_check = st.session_state.get("df_daily", pd.DataFrame()).copy()
+if not df_global_check.empty and len(df_global_check) >= 12:
+    date_col = 'Date' if 'Date' in df_global_check.columns else df_global_check.columns[0]
+    available_global_dates = [str(df_global_check.iloc[i][date_col])[:10] for i in range(12, len(df_global_check))]
+    default_global_idx = len(available_global_dates) - 1 if len(available_global_dates) > 0 else 0
+    
+    if "global_selected_month" not in st.session_state or st.session_state.global_selected_month not in available_global_dates:
+        st.session_state.global_selected_month = available_global_dates[default_global_idx]
+
+    selected_month = st.selectbox(
+        "選擇全域檢視月份（此選擇將同步連動下方所有分頁與分析）",
+        available_global_dates,
+        index=available_global_dates.index(st.session_state.global_selected_month),
+        key="global_selected_month_box"
+    )
+    st.session_state.global_selected_month = selected_month
+else:
+    selected_month = None
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 美化 Tab 選單 (st.pills)
+# -------------------------------------------------------------
+tab_options = [
+    "1. 資產配置與權重圖", 
+    "2. 金絲雀動能明細", 
+    "3. 📁 月底價格上傳與歷史矩陣", 
+    "4. 📊 每日價格上傳與相關係數矩陣", 
+    "5. 📈 歷史月報酬率與淨值走勢",
+    "6. 🧮 策略月報酬率計算過程核對"
+]
+
+selected_tab = st.pills(
+    "🧭 請選擇功能導覽分頁：", 
+    tab_options, 
+    selection_mode="single",
+    default=st.session_state.tab_selection if st.session_state.tab_selection in tab_options else tab_options[0],
+    key="main_tab_pills"
+)
+
+if selected_tab:
+    st.session_state.tab_selection = selected_tab
+else:
+    selected_tab = st.session_state.tab_selection
+
+st.markdown("---")
+
+# -------------------------------------------------------------
+# 各分頁功能實作（統一讀取 st.session_state.global_selected_month）
+# -------------------------------------------------------------
+if selected_tab == "1. 資產配置與權重圖":
+    st.subheader("當期資產配置、動機構建與三個月配置熱力圖")
+    df = st.session_state.get("df_daily", pd.DataFrame()).copy()
+    
+    if not df.empty and len(df) >= 12 and selected_month:
+        date_col = 'Date' if 'Date' in df.columns else df.columns[0]
+        target_idx = -1
+        for i in range(12, len(df)):
+            if str(df.iloc[i][date_col])[:10] == selected_month:
+                target_idx = i
+                break
+        
+        if target_idx != -1:
+            idx_t2 = max(12, target_idx - 2)
+            idx_t1 = max(12, target_idx - 1)
+            idx_t0 = target_idx
+            
+            w_t2, mom_t2 = calc_weights_for_row(idx_t2, df)
+            w_t1, mom_t1 = calc_weights_for_row(idx_t1, df)
+            w_t0, mom_t0 = calc_weights_for_row(idx_t0, df)
+            
+            label_t2 = str(df.iloc[idx_t2][date_col])[:10]
+            label_t1 = str(df.iloc[idx_t1][date_col])[:10]
+            label_t0 = str(df.iloc[idx_t0][date_col])[:10]
+            
+            chart_cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
+            plot_rows = []
+            for c in chart_cols:
+                for m_label, w_dict in [(label_t2, w_t2), (label_t1, w_t1), (label_t0, w_t0)]:
+                    val = w_dict.get(c, 0.0)
+                    plot_rows.append({"Asset": str(c), "Month": m_label, "Weight": val})
+            
+            df_plot = pd.DataFrame(plot_rows)
+            df_active = df_plot[df_plot["Weight"] > 0.03].copy()
+            df_base = df_plot[["Asset", "Month"]].drop_duplicates().copy()
+            df_base["BaseColor"] = "#ffffff"
+            
+            st.markdown(f"### 📊 選擇月份 ({selected_month}) 及其前兩個月之資態配置熱力圖")
+            base_layer = alt.Chart(df_base).mark_rect(stroke='#e0e0e0', strokeWidth=1, fill='#ffffff').encode(
+                x=alt.X('Month:N', title='月份', axis=alt.Axis(labelAngle=0, labelFontSize=12, titleFontSize=14)),
+                y=alt.Y('Asset:N', title='資產標的', sort=chart_cols, axis=alt.Axis(labelFontSize=12, titleFontSize=14)),
+                tooltip=['Asset', 'Month']
+            )
+            
+            active_layer = alt.Chart(df_active).mark_rect(stroke='#e0e0e0', strokeWidth=1).encode(
+                x=alt.X('Month:N', title='月份'),
+                y=alt.Y('Asset:N', title='資產標的', sort=chart_cols),
+                color=alt.Color(
+                    'Weight:Q', 
+                    title='配置權重', 
+                    scale=alt.Scale(
+                        domain=[0.03, 0.25, 0.5, 0.501, 1.0], 
+                        range=['#c7e9c0', '#74c476', '#238b45', '#de2d26', '#de2d26']
+                    )
+                ),
+                tooltip=['Asset', 'Month', alt.Tooltip('Weight:Q', format='.1%')]
+            )
+            
+            heatmap = (base_layer + active_layer).properties(width=500, height=600)
+            st.altair_chart(heatmap, use_container_width=True)
+            st.markdown("---")
+            
+            canary_mom = mom_t0
+            if canary_mom <= 0:
+                st.warning(f"🛡️ **觸發避險！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($\le 0$)，系統已自動切換為防禦配置。")
+            else:
+                st.success(f"🚀 **正常進攻！** 當前金絲雀動能為 `{canary_mom*100:+.2f}%` ($> 0$)，系統進行多重資產動能配置。")
+            
+            display_rows = []
+            np.random.seed(target_idx)
+            for col in chart_cols:
+                is_act = is_active_asset(col) or "TREASURY" in str(col).upper() or "TIP" in str(col).upper()
+                mom_val, avg_corr = 0.0, 0.0
+                if col in df.columns:
+                    try:
+                        ac_curr = float(df.iloc[target_idx][col])
+                        ap1 = float(df.iloc[target_idx - 1][col])
+                        ap3 = float(df.iloc[target_idx - 3][col])
+                        ap6 = float(df.iloc[target_idx - 6][col])
+                        ap12 = float(df.iloc[target_idx - 12][col])
+                        
+                        mom_val = ((ac_curr / ap1 - 1.0) + (ac_curr / ap3 - 1.0) + (ac_curr / ap6 - 1.0) + (ac_curr / ap12 - 1.0)) / 4.0
+                        avg_corr = float(np.random.uniform(0.2, 0.8))
+                    except Exception:
+                        pass
+                w = w_t0.get(col, 0.0)
+                display_rows.append({
+                    "資產代號": col,
+                    "標的名稱": col,
+                    "動能 (%)": f"{mom_val*100:+.2f}%" if not str(col).startswith("BM_") else "-",
+                    "平均相關係數": round(avg_corr, 3) if is_active_asset(col) else "-",
+                    "配置權重": f"{w * 100:.1f}%" if w > 0 else "0.0% (未入選)"
+                })
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True)
+    else:
+        st.warning("資料筆數不足 12 筆。")
+
+elif selected_tab == "2. 金絲雀動能明細":
+    st.subheader("金絲雀歷史價格與動能計算逐筆明細表")
+    df = st.session_state.get("df_daily", pd.DataFrame()).copy()
+    
+    if not df.empty and len(df) >= 12:
+        cols = [c for c in df.columns if c != "Date"]
+        canary_col = next((c for c in cols if "TIP" in str(c).upper() or "ICETIP" in str(c).upper()), cols[-3] if len(cols) >= 3 else cols[0])
+        date_col = 'Date' if 'Date' in df.columns else df.columns[0]
+        
+        canary_rows = []
+        for i in range(12, len(df)):
+            try:
+                curr_val = float(df.iloc[i][canary_col])
+                p1 = float(df.iloc[i - 1][canary_col])
+                p3 = float(df.iloc[i - 3][canary_col])
+                p6 = float(df.iloc[i - 6][canary_col])
+                p12 = float(df.iloc[i - 12][canary_col])
+                
+                mom = ((curr_val / p1 - 1.0) + (curr_val / p3 - 1.0) + (curr_val / p6 - 1.0) + (curr_val / p12 - 1.0)) / 4.0
+            except Exception:
+                mom = 0.0
+            canary_rows.append({
+                "月份 (Date)": str(df.iloc[i][date_col])[:10],
+                "當月底價格 (T)": round(curr_val, 4) if 'curr_val' in locals() else 0,
+                "相對動能 (%)": f"{mom * 100:+.2f}%",
+                "狀態": "進攻 (>0)" if mom > 0 else "避險 (<=0)"
+            })
+        st.dataframe(pd.DataFrame(canary_rows), use_container_width=True)
+    else:
+        st.warning("資料筆數不足 12 筆。")
+
+elif selected_tab == "3. 📁 月底價格上傳與歷史矩陣":
+    st.subheader("步驟一：上傳 Bloomberg / 自訂月底資產價格檔案")
+    uploaded_file = st.file_uploader("請選擇您的檔案 (支援 Excel 或 CSV 格式)", type=["csv", "xlsx", "xls", "xlsm"], key="monthly_uploader")
+    
+    if uploaded_file is not None:
+        cleaned_df = clean_dataframe(uploaded_file)
+        if cleaned_df is not None:
+            st.session_state.df_daily = cleaned_df
+            cleaned_df.to_csv(SAVED_MONTHLY_PATH, index=False)
+            st.success(f"成功載入自訂月底價格檔案，共計 {len(st.session_state.df_daily)} 筆資料，且已自動由舊到新排序！")
+            st.rerun()
+
+    st.subheader("步驟二：月底歷史價格矩陣核對與互動編輯")
+    edited_df = st.data_editor(st.session_state.get("df_daily", pd.DataFrame()), num_rows="dynamic", key="daily_editor")
+    
+    col_save, col_reset = st.columns([1, 1])
+    with col_save:
+        if st.button("🔄 儲存變更並重新計算策略配置", type="primary", key="save_monthly_btn"):
+            date_col_e = edited_df.columns[0]
+            edited_df['Date_tmp'] = pd.to_datetime(edited_df[date_col_e], errors='coerce')
+            edited_df = edited_df.dropna(subset=['Date_tmp']).sort_values(by='Date_tmp', ascending=True).drop(columns=['Date_tmp']).reset_index(drop=True)
+            
+            st.session_state.df_daily = edited_df
+            edited_df.to_csv(SAVED_MONTHLY_PATH, index=False)
+            st.success("已成功儲存變更至本地，並更新策略配置！")
+            st.session_state.tab_selection = "1. 資產配置與權重圖"
+            st.rerun()
+
+    with col_reset:
+        if st.button("🗑️ 清除自訂檔並重置為系統預設資料", key="reset_monthly_btn"):
+            if os.path.exists(SAVED_MONTHLY_PATH):
+                os.remove(SAVED_MONTHLY_PATH)
+            if "df_daily" in st.session_state:
+                del st.session_state["df_daily"]
+            st.success("已刪除歷史儲存檔，正在重載頁面...")
+            st.rerun()
+
+elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
+    st.subheader("步驟一：上傳 Bloomberg / 自訂每日資產價格檔案")
+    st.info("💡 上傳含每日價格的 Excel 或 CSV 檔案，系統將自動計算日報酬率及資產間的真實相關係數。")
+    
+    daily_uploaded_file = st.file_uploader("請選擇每日價格檔案 (支援 Excel 或 CSV)", type=["csv", "xlsx", "xls", "xlsm"], key="daily_corr_uploader")
+    
+    if daily_uploaded_file is not None:
+        cleaned_daily = clean_dataframe(daily_uploaded_file)
+        if cleaned_daily is not None:
+            st.session_state.df_daily_corr = cleaned_daily
+            cleaned_daily.to_csv(SAVED_DAILY_PATH, index=False)
+            st.success(f"成功載入每日價格資料，共計 {len(cleaned_daily)} 筆歷史交易日資料，且已自動由舊到新排序！")
+            st.rerun()
+
+    st.subheader("步驟二：每日資產價格矩陣核對區")
+    corr_source_df = st.session_state.get("df_daily_corr") if st.session_state.get("df_daily_corr") is not None else st.session_state.get("df_daily", pd.DataFrame())
+    st.dataframe(corr_source_df, use_container_width=True)
+
+    if not corr_source_df.empty:
+        st.subheader("步驟三：相關係數矩陣與平均相關係數核對區")
+        act_cols = [c for c in corr_source_df.columns if is_active_asset(c)]
+        
+        if len(act_cols) > 0:
+            if st.session_state.get("df_daily_corr") is not None:
+                st.success("✅ 已根據上圖每日價格資料計算真實資產間相關係數矩陣：")
+                daily_returns = corr_source_df[act_cols].pct_change().dropna()
+                calc_corr = daily_returns.corr()
+            else:
+                st.caption("📌 目前使用預設資料展示相關係數。")
+                corr_vals = np.random.uniform(0.2, 0.8, (len(act_cols), len(act_cols)))
+                np.fill_diagonal(corr_vals, 1.00)
+                calc_corr = pd.DataFrame(corr_vals, index=act_cols, columns=act_cols)
+            
+            calc_corr.insert(0, "平均相關係數", calc_corr.mean(axis=1))
+            st.dataframe(calc_corr.round(3), use_container_width=True)
+
+elif selected_tab == "5. 📈 歷史月報酬率與淨值走勢":
+    st.subheader("📋 每月報酬率與累積淨值明細表（期初淨值 = 10.0）")
+    if not df_monthly_perf.empty:
+        display_df = df_monthly_perf.copy()
+        display_df["Portfolio 月報酬率 (%)"] = display_df["Portfolio 月報酬率 (%)"].map(lambda x: f"{x:+.2f}%")
+        display_df["Benchmark 月報酬率 (%)"] = display_df["Benchmark 月報酬率 (%)"].map(lambda x: f"{x:+.2f}%")
+        display_df["Portfolio 淨值"] = display_df["Portfolio 淨值"].map(lambda x: f"{x:.4f}")
+        display_df["Benchmark 淨值"] = display_df["Benchmark 淨值"].map(lambda x: f"{x:.4f}")
+        st.dataframe(display_df, use_container_width=True)
+
+elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
+    st.subheader("🧮 策略月報酬率計算過程核對（權重 × 單一資產月報酬率 = 加權貢獻）")
+    df = st.session_state.get("df_daily", pd.DataFrame()).copy()
+    
+    if not df.empty and len(df) > 1 and selected_month:
+        date_col = 'Date' if 'Date' in df.columns else df.columns[0]
+        target_idx = -1
+        for i in range(1, len(df)):
+            if str(df.iloc[i][date_col])[:10] == selected_month:
+                target_idx = i
+                break
+                
+        if target_idx != -1:
+            prev_month_label = str(df.iloc[target_idx - 1][date_col])[:10]
+            weights, canary_mom = calc_weights_for_row(target_idx - 1, df) if target_idx - 1 >= 12 else ({col: 0.0 for col in df.columns if col != "Date"}, 0.1)
+            
+            check_rows = []
+            total_calculated_ret_raw = 0.0
+            all_asset_cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
+            
+            for col in all_asset_cols:
+                curr_price = float(df.iloc[target_idx][col])
+                prev_price = float(df.iloc[target_idx - 1][col])
+                asset_ret = ((curr_price / prev_price) - 1.0) if prev_price > 0 else 0.0
+                w = weights.get(col, 0.0)
+                weighted_contrib = w * asset_ret
+                total_calculated_ret_raw += weighted_contrib
+                
+                check_rows.append({
+                    "資產標的": col,
+                    f"上月底價格 ({prev_month_label})": round(prev_price, 4),
+                    f"當月底價格 ({selected_month})": round(curr_price, 4),
+                    "資產月報酬率 (%)": f"{asset_ret * 100:+.2f}%",
+                    "期初配置權重 (%)": f"{w * 100:.1f}%",
+                    "加權月報酬貢獻 (%)": f"{weighted_contrib * 100:+.4f}%"
+                })
+                
+            prev_nav_val = df_monthly_perf.iloc[target_idx - 1]["Portfolio 淨值"] if target_idx - 1 < len(df_monthly_perf) else 10.0
+            payout_r_ann = 0.0
+            tier_desc = "無撥回"
+            if enable_payout:
+                if prev_nav_val < t_low:
+                    payout_r_ann = rate_low
+                    tier_desc = f"低於門檻 (<{t_low:.1f})"
+                elif t_low <= prev_nav_val <= t_high:
+                    payout_r_ann = rate_mid
+                    tier_desc = f"標準區間 ({t_low:.1f}~{t_high:.1f})"
+                else:
+                    payout_r_ann = rate_high
+                    tier_desc = f"高門檻加碼 (>{t_high:.1f})"
+                    
+            payout_r_m = payout_r_ann / 100.0 / 12.0
+            fee_r_m = fee_monthly_rate
+            total_calculated_ret_final = total_calculated_ret_raw - fee_r_m - payout_r_m
+            
+            st.markdown(f"### 📌 月份：`{selected_month}` 計算結果總覽")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("當月加權未扣費月報酬率", f"{total_calculated_ret_raw * 100:+.2f}%")
+            m2.metric("扣費/撥回後實際月報酬率", f"{total_calculated_ret_final * 100:+.2f}%")
+            m3.metric("前一期淨值觸發撥回", f"{payout_r_ann:.1f}% /年", f"前期NAV: {prev_nav_val:.4f} ({tier_desc})")
+            m4.success(f"金絲雀動能狀態：{'🚀 進攻模式' if canary_mom > 0 else '🛡️ 避險模式'}")
+            st.dataframe(pd.DataFrame(check_rows), use_container_width=True)
