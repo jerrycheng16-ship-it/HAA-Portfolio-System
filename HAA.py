@@ -221,7 +221,7 @@ if "df_daily" not in st.session_state:
 # -------------------------------------------------------------
 # 頂部控制項：回測日期與參數設定區
 # -------------------------------------------------------------
-with st.expander("⚙️ 數據同步區間、費用與階梯撥回率（配息）參數設定區", expanded=True):
+with st.expander("⚙️ 數據同步區間、費用、階梯撥回率與相關係數權重邏輯設定區", expanded=True):
     col_d1, col_d2, col_btn = st.columns([2, 2, 1])
     with col_d1:
         start_date = st.date_input("回測開始日期", value=datetime(2023, 1, 1))
@@ -231,6 +231,19 @@ with st.expander("⚙️ 數據同步區間、費用與階梯撥回率（配息�
         st.write("")
         st.write("")
         sync_btn = st.button("🌐 從 Yahoo 自動同步", type="primary", use_container_width=True)
+
+    st.markdown("---")
+    
+    # 新增：相關係數權重分配邏輯選擇
+    st.markdown("#### 🔗 相關係數權重分配邏輯設定")
+    corr_logic_choice = st.radio(
+        "請選擇相關係數與資產權重高低的對應關係：",
+        ("相關性越小，權重越高（低相關優先配置）", "相關性越大，權重越高（高相關優先配置）"),
+        index=0,
+        key="corr_logic_radio",
+        horizontal=True
+    )
+    reverse_flag = True if "越大" in corr_logic_choice else False
 
     st.markdown("---")
     col_fee, col_payout_chk = st.columns([1, 2])
@@ -288,9 +301,9 @@ def is_active_asset(col_name):
     return True
 
 # -------------------------------------------------------------
-# 核心 HAA 配置計算函式
+# 核心 HAA 配置計算函式 (支援 reverse_flag 參數決定相關性大小與權重的方向)
 # -------------------------------------------------------------
-def calc_weights_for_row(target_idx, df):
+def calc_weights_for_row(target_idx, df, reverse_flag=True):
     cols = [c for c in df.columns if c != "Date" and not str(c).startswith("BM_")]
     canary_col = next((c for c in cols if "TIP" in str(c).upper() or "ICETIP" in str(c).upper()), cols[-3] if len(cols) >= 3 else cols[0])
     bond_col = next((c for c in cols if "TREASURY" in str(c).upper() or "7-10" in str(c)), cols[-2] if len(cols) >= 2 else cols[0])
@@ -346,7 +359,9 @@ def calc_weights_for_row(target_idx, df):
                 
         active_results.sort(key=lambda x: x["mom"], reverse=True)
         valid_selected = [item for item in active_results if item["mom"] > 0][:7]
-        valid_selected.sort(key=lambda x: x["avgCorr"], reverse=True)
+        
+        # 依據選項決定排序方向：reverse=True (相關性大優先), reverse=False (相關性小優先)
+        valid_selected.sort(key=lambda x: x["avgCorr"], reverse=reverse_flag)
         
         K = len(valid_selected)
         S = K * (K + 1) / 2 if K > 0 else 1
@@ -395,7 +410,7 @@ for i in range(1, len(df_global)):
     port_ret_raw = 0.0
     canary_status_str = "正常進攻"
     if i - 1 >= 12:
-        weights, canary_mom = calc_weights_for_row(i - 1, df_global)
+        weights, canary_mom = calc_weights_for_row(i - 1, df_global, reverse_flag)
         if canary_mom <= 0:
             canary_status_str = "避險模式"
         for asset, w in weights.items():
@@ -644,9 +659,9 @@ if selected_tab == "1. 資產配置與權重圖":
             idx_t1 = max(12, target_idx - 1)
             idx_t0 = target_idx
             
-            w_t2, mom_t2 = calc_weights_for_row(idx_t2, df)
-            w_t1, mom_t1 = calc_weights_for_row(idx_t1, df)
-            w_t0, mom_t0 = calc_weights_for_row(idx_t0, df)
+            w_t2, mom_t2 = calc_weights_for_row(idx_t2, df, reverse_flag)
+            w_t1, mom_t1 = calc_weights_for_row(idx_t1, df, reverse_flag)
+            w_t0, mom_t0 = calc_weights_for_row(idx_t0, df, reverse_flag)
             
             label_t2 = str(df.iloc[idx_t2][date_col])[:10]
             label_t1 = str(df.iloc[idx_t1][date_col])[:10]
@@ -820,7 +835,6 @@ elif selected_tab == "4. 📊 每日價格上傳與相關係數矩陣":
             
             if global_selected_month:
                 sel_dt = pd.to_datetime(global_selected_month)
-                # 找出小於或等於選定月份月底的資料，並往前取最近 6 個月（約 126 個交易日）
                 mask = temp_df['Date_dt'] <= sel_dt
                 df_filtered = temp_df[mask].tail(126).copy()
             else:
@@ -863,7 +877,7 @@ elif selected_tab == "6. 🧮 策略月報酬率計算過程核對":
                 
         if target_idx != -1:
             prev_month_label = str(df.iloc[target_idx - 1][date_col])[:10]
-            weights, canary_mom = calc_weights_for_row(target_idx - 1, df) if target_idx - 1 >= 12 else ({col: 0.0 for col in df.columns if col != "Date"}, 0.1)
+            weights, canary_mom = calc_weights_for_row(target_idx - 1, df, reverse_flag) if target_idx - 1 >= 12 else ({col: 0.0 for col in df.columns if col != "Date"}, 0.1)
             
             check_rows = []
             total_calculated_ret_raw = 0.0
